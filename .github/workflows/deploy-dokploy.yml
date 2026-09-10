@@ -1,0 +1,52 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dokploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Only deploy the exact commit that was tested: a successful CI run on the
+    # default branch of this repository, triggered by a real push.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Trigger deployment in Dokploy
+        run: |
+          curl -fsS -X POST "${DOKPLOY_URL}/api/application.deploy" \
+            -H "x-api-key: ${DOKPLOY_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"applicationId\": \"${DOKPLOY_APPLICATION_ID}\"}"
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          DOKPLOY_APPLICATION_ID: ${{ secrets.DOKPLOY_APPLICATION_ID }}
+
+      - name: Wait for healthy deployment
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -sf "${PRODUCTION_URL}/healthz" > /dev/null 2>&1; then
+              echo "Deployment healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Deployment not healthy after 5 minutes" >&2
+          exit 1
+        env:
+          PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}

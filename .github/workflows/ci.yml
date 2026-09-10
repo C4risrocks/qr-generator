@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:d4bb0a8c1b7bb2e29f976d099e7bfb9a5d8858cffe9e46b35cd302cd1f1f8168
+        env:
+          POSTGRES_DB: qrgen
+          POSTGRES_USER: qrgen
+          POSTGRES_PASSWORD: qrgen_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U qrgen -d qrgen"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://qrgen:qrgen_ci@localhost:5432/qrgen
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Apply migrations
+        run: uv run qrgen migrate --wait 30
+
+      - name: Test
+        run: uv run pytest -q
+
+  docker:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: qrgen:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+
+      - name: Smoke test container
+        run: |
+          docker run -d --name qrgen-db \
+            -e POSTGRES_DB=qrgen -e POSTGRES_USER=qrgen -e POSTGRES_PASSWORD=qrgen_ci \
+            postgres:17-alpine@sha256:d4bb0a8c1b7bb2e29f976d099e7bfb9a5d8858cffe9e46b35cd302cd1f1f8168
+          docker run -d --name qrgen-ci -p 127.0.0.1:8000:8000 \
+            --link qrgen-db:db \
+            -e DATABASE_URL=postgresql+asyncpg://qrgen:qrgen_ci@db:5432/qrgen \
+            -e SESSION_SECRET=ci-secret \
+            qrgen:ci
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8000/readyz > /dev/null; then break; fi
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:8000/healthz | grep -q '"status":"ok"'
+          curl -sf http://127.0.0.1:8000/readyz | grep -q '"status":"ok"'
+          curl -sf http://127.0.0.1:8000/ | grep -q "QR Studio"
+          curl -sf http://127.0.0.1:8000/api/catalog -o /dev/null
+          curl -sf -F "data=https://ejemplo.com" http://127.0.0.1:8000/api/generate -o /dev/null
+          curl -sf -F "data=https://ejemplo.com" http://127.0.0.1:8000/api/previews -o /dev/null
+          curl -sf http://127.0.0.1:8000/admin/login -o /dev/null
+
+      - name: Remove test containers
+        if: always()
+        run: docker rm -f qrgen-ci qrgen-db || true
+
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # v0.30.0
+        with:
+          image-ref: qrgen:ci
+          severity: HIGH,CRITICAL
+          exit-code: 1
+          ignore-unfixed: true

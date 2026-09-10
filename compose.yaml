@@ -1,0 +1,59 @@
+# Docker Compose for local development / self-hosting.
+# For Dokploy, prefer the Application service (Git + Dockerfile) with a
+# managed PostgreSQL service. Secrets never live here.
+
+services:
+  db:
+    image: postgres:17-alpine@sha256:d4bb0a8c1b7bb2e29f976d099e7bfb9a5d8858cffe9e46b35cd302cd1f1f8168
+    container_name: qrgen-db
+    environment:
+      POSTGRES_DB: qrgen
+      POSTGRES_USER: qrgen
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qrgen_local}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qrgen -d qrgen"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qrgen:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: qrgen:local
+    container_name: qrgen
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://qrgen:${POSTGRES_PASSWORD:-qrgen_local}@db:5432/qrgen
+      SESSION_SECRET: ${SESSION_SECRET:-local-session-secret-change-me}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:-}
+      RATE_LIMIT_GENERATE_PER_DAY: ${RATE_LIMIT_GENERATE_PER_DAY:-250}
+      RATE_LIMIT_PREVIEWS_PER_DAY: ${RATE_LIMIT_PREVIEWS_PER_DAY:-500}
+      RATE_LIMIT_WINDOW_RETENTION_HOURS: ${RATE_LIMIT_WINDOW_RETENTION_HOURS:-48}
+      INPUT_RETENTION_DAYS: ${INPUT_RETENTION_DAYS:-30}
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3)"]
+      interval: 30s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+volumes:
+  pgdata:

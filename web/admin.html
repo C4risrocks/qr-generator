@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="es" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Panel · QR Studio Admin</title>
+  <style>
+    :root {
+      --bg: #fafafa; --surface: #ffffff; --surface-2: #f4f4f5;
+      --border: #e4e4e7; --border-strong: #d4d4d8;
+      --text: #18181b; --muted: #52525b; --faint: #71717a;
+      --accent: #2563eb; --accent-strong: #1d4ed8; --warn: #d97706; --error: #dc2626; --ok: #16a34a;
+    }
+    [data-theme="dark"] {
+      --bg: #0c0c0e; --surface: #151518; --surface-2: #1c1c21;
+      --border: #26262c; --border-strong: #34343c;
+      --text: #f4f4f5; --muted: #a1a1aa; --faint: #8b8b95;
+      --accent: #60a5fa; --accent-strong: #93c5fd; --warn: #fbbf24;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      font-size: 14px;
+    }
+    header {
+      display: flex; align-items: center; gap: 12px; padding: 14px 24px;
+      border-bottom: 1px solid var(--border); background: var(--surface);
+      position: sticky; top: 0; z-index: 10;
+    }
+    header h1 { margin: 0; font-size: 16px; }
+    .spacer { flex: 1; }
+    a { color: var(--accent); text-decoration: none; font-size: 13px; }
+    a:hover { text-decoration: underline; }
+    main { max-width: 1200px; margin: 0 auto; padding: 24px; display: grid; gap: 20px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+    .stat {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+      padding: 16px;
+    }
+    .stat .value { font-size: 26px; font-weight: 700; }
+    .stat .label { font-size: 12px; color: var(--faint); margin-top: 2px; }
+    .panel {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px;
+    }
+    .panel h2 { margin: 0 0 12px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--faint); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .pill { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border-strong); color: var(--faint); }
+    .pill.warn { color: var(--warn); border-color: var(--warn); }
+    .pill.ok { color: var(--ok); border-color: var(--ok); }
+    canvas { width: 100%; max-width: 900px; }
+    #error { color: var(--error); }
+    .bar { height: 8px; border-radius: 999px; background: var(--surface-2); overflow: hidden; min-width: 90px; }
+    .bar span { display: block; height: 100%; background: var(--accent); }
+    .bar.warn span { background: var(--warn); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Panel · QR Studio</h1>
+    <div class="spacer"></div>
+    <a href="/">&larr; Generador</a>
+    <form action="/admin/logout" method="post"><button style="border:none;background:none;color:var(--accent);cursor:pointer;font-size:13px;padding:0;">Salir</button></form>
+  </header>
+  <main>
+    <div id="error" role="alert"></div>
+    <section class="cards" id="stats"></section>
+    <section class="panel">
+      <h2>Peticiones por día (últimos 14 días)</h2>
+      <canvas id="usage-chart" height="220"></canvas>
+    </section>
+    <section class="panel">
+      <h2>Clientes recientes (hoy)</h2>
+      <div style="overflow-x:auto"><table id="clients-table"></table></div>
+    </section>
+    <section class="panel">
+      <h2>Inputs recientes (contenido truncado)</h2>
+      <div style="overflow-x:auto"><table id="inputs-table"></table></div>
+    </section>
+    <section class="panel">
+      <h2>Configuración vigente</h2>
+      <table id="config-table"></table>
+    </section>
+  </main>
+  <script>
+    "use strict";
+    const $ = (id) => document.getElementById(id);
+    const errorEl = $("error");
+
+    async function api(path) {
+      const res = await fetch(path);
+      if (res.status === 401) { window.location.href = "/admin/login"; throw new Error("redirect"); }
+      if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || "error"); }
+      return res.json();
+    }
+
+    function renderStats(summary) {
+      const el = $("stats");
+      el.innerHTML = "";
+      const items = [
+        ["Peticiones hoy", Object.values(summary.requests_today).reduce((a, b) => a + b, 0)],
+        ["generate hoy", summary.requests_today.generate || 0, "/" + summary.limits.generate],
+        ["previews hoy", summary.requests_today.previews || 0, "/" + summary.limits.previews],
+        ["Clientes únicos hoy", summary.unique_clients_today],
+        ["Inputs hoy", summary.inputs_today],
+        ["Clientes totales", summary.clients_total],
+      ];
+      for (const [label, value, extra] of items) {
+        const card = document.createElement("div");
+        card.className = "stat";
+        card.innerHTML = '<div class="value">' + value + "</div><div class=\"label\">" + label + " " + (extra || "") + "</div>";
+        el.appendChild(card);
+      }
+    }
+
+    function renderChart(series) {
+      const canvas = $("usage-chart");
+      const ctx = canvas.getContext("2d");
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = canvas.clientWidth * dpr;
+      canvas.height = 220 * dpr;
+      ctx.scale(dpr, dpr);
+      const W = canvas.clientWidth, H = 220;
+      ctx.clearRect(0, 0, W, H);
+      const max = Math.max(1, ...series.map((s) => Math.max(s.generate, s.previews)));
+      const pad = 40, bottom = 26;
+      const bw = (W - pad * 2) / series.length;
+      series.forEach((s, i) => {
+        const x = pad + i * bw;
+        const gH = (s.generate / max) * (H - bottom - 14);
+        const pH = (s.previews / max) * (H - bottom - 14);
+        ctx.fillStyle = "#2563eb";
+        ctx.fillRect(x + bw * 0.18, H - bottom - gH, bw * 0.24, gH);
+        ctx.fillStyle = "#93c5fd";
+        ctx.fillRect(x + bw * 0.55, H - bottom - pH, bw * 0.24, pH);
+        ctx.fillStyle = "#71717a";
+        ctx.font = "10px system-ui";
+        ctx.textAlign = "center";
+        ctx.fillText(s.date.slice(5), x + bw / 2, H - 8);
+      });
+      ctx.fillStyle = "#71717a";
+      ctx.textAlign = "left";
+      ctx.fillText("generate", pad, 12);
+      ctx.fillStyle = "#93c5fd";
+      ctx.fillRect(pad + 62, 4, 10, 8);
+      ctx.fillStyle = "#71717a";
+      ctx.fillText("previews", pad + 78, 12);
+    }
+
+    function renderClients(clients) {
+      const table = $("clients-table");
+      if (!clients.length) { table.innerHTML = "<tr><td>Sin datos hoy.</td></tr>"; return; }
+      table.innerHTML =
+        "<thead><tr><th>IP</th><th>User-Agent</th><th>Idioma</th><th>País</th><th>generate</th><th>previews</th><th>Uso</th><th>Última vez</th></tr></thead>";
+      const rows = clients.map((c) =>
+        "<tr><td class=\"mono\">" + esc(c.ip) + "</td><td class=\"mono\">" + esc(c.user_agent) + "</td>" +
+        "<td>" + esc(c.accept_language || "") + "</td><td>" + esc(c.country || "") + "</td>" +
+        "<td>" + c.generate_today + "</td><td>" + c.previews_today + "</td>" +
+        '<td><div class="bar' + (c.usage_pct >= 80 ? " warn" : "") + '"><span style="width:' + Math.min(100, c.usage_pct) + '%"></span></div></td>' +
+        "<td class=\"mono\">" + esc((c.last_seen || "").replace("T", " ").slice(0, 19)) + "</td></tr>"
+      ).join("");
+      table.insertAdjacentHTML("beforeend", rows);
+    }
+
+    function renderInputs(inputs) {
+      const table = $("inputs-table");
+      if (!inputs.length) { table.innerHTML = "<tr><td>Sin inputs registrados.</td></tr>"; return; }
+      table.innerHTML =
+        "<thead><tr><th>ID</th><th>Cliente</th><th>Archivo</th><th>Contenido</th><th>Fecha</th></tr></thead>";
+      const rows = inputs.map((i) =>
+        "<tr><td>" + i.id + "</td><td>" + (i.client_id ?? "") + "</td><td>" + esc(i.filename || "&mdash;") + "</td>" +
+        '<td class="mono">' + esc(i.content) + "</td>" +
+        "<td class=\"mono\">" + esc((i.created_at || "").replace("T", " ").slice(0, 19)) + "</td></tr>"
+      ).join("");
+      table.insertAdjacentHTML("beforeend", rows);
+    }
+
+    function renderConfig(config) {
+      const table = $("config-table");
+      table.innerHTML =
+        "<tr><td>Límite generate (por día)</td><td class=\"mono\">" + config.rate_limits.generate + "</td></tr>" +
+        "<tr><td>Límite previews (por día)</td><td class=\"mono\">" + config.rate_limits.previews + "</td></tr>" +
+        "<tr><td>Retención ventanas rate limit</td><td class=\"mono\">" + config.rate_limit_window_retention_hours + " h</td></tr>" +
+        "<tr><td>Retención inputs</td><td class=\"mono\">" + config.input_retention_days + " días</td></tr>";
+    }
+
+    function esc(value) {
+      return String(value).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    (async function init() {
+      try {
+        const [summary, usage, clients, inputs, config] = await Promise.all([
+          api("/admin/api/summary"),
+          api("/admin/api/usage?days=14"),
+          api("/admin/api/clients?limit=50"),
+          api("/admin/api/inputs?limit=50"),
+          api("/admin/api/config"),
+        ]);
+        renderStats(summary);
+        renderChart(usage.series);
+        renderClients(clients.clients);
+        renderInputs(inputs.inputs);
+        renderConfig(config);
+      } catch (err) {
+        if (err.message !== "redirect") errorEl.textContent = err.message;
+      }
+    })();
+  </script>
+</body>
+</html>

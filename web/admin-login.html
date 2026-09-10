@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="es" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Acceso · QR Studio Admin</title>
+  <style>
+    :root {
+      --bg: #fafafa; --surface: #ffffff; --surface-2: #f4f4f5;
+      --border: #e4e4e7; --border-strong: #d4d4d8;
+      --text: #18181b; --muted: #52525b; --faint: #71717a;
+      --accent: #2563eb; --accent-strong: #1d4ed8; --error: #dc2626;
+    }
+    [data-theme="dark"] {
+      --bg: #0c0c0e; --surface: #151518; --surface-2: #1c1c21;
+      --border: #26262c; --border-strong: #34343c;
+      --text: #f4f4f5; --muted: #a1a1aa; --faint: #8b8b95;
+      --accent: #60a5fa; --accent-strong: #93c5fd;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      background: var(--bg); color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      font-size: 14px;
+    }
+    .card {
+      width: 100%; max-width: 360px; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 12px; padding: 28px;
+      box-shadow: 0 8px 24px rgba(24,24,27,.06);
+    }
+    h1 { margin: 0 0 4px; font-size: 18px; }
+    .subtitle { margin: 0 0 20px; color: var(--faint); font-size: 12px; }
+    label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 5px; }
+    input {
+      width: 100%; background: var(--surface-2); border: 1px solid var(--border);
+      color: var(--text); border-radius: 8px; padding: 10px 11px; font-size: 14px; font-family: inherit;
+    }
+    input:focus { outline: none; border-color: var(--accent); }
+    button {
+      width: 100%; margin-top: 18px; border: none; border-radius: 8px; padding: 11px;
+      background: var(--accent); color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+    }
+    button:hover { background: var(--accent-strong); }
+    button:disabled { opacity: .5; cursor: wait; }
+    #error { margin-top: 12px; color: var(--error); font-size: 13px; min-height: 18px; }
+    .back { display: block; margin-top: 16px; text-align: center; font-size: 12px; color: var(--faint); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Panel de administración</h1>
+    <p class="subtitle">QR Studio · solo personal autorizado</p>
+    <form id="login-form">
+      <label for="username">Usuario</label>
+      <input id="username" name="username" autocomplete="username" required autofocus>
+      <label for="password">Contraseña</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit">Entrar</button>
+    </form>
+    <div id="error" role="alert"></div>
+    <a class="back" href="/">&larr; Volver al generador</a>
+  </div>
+  <script>
+    document.getElementById("login-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const error = document.getElementById("error");
+      const button = document.querySelector("button");
+      error.textContent = "";
+      button.disabled = true;
+      try {
+        const res = await fetch("/admin/login", {
+          method: "POST",
+          body: new FormData(e.target),
+        });
+        if (res.redirected) { window.location.href = res.url; return; }
+        const detail = await res.json().catch(() => ({}));
+        error.textContent = detail.detail || "Error al iniciar sesión";
+      } catch (err) {
+        error.textContent = err.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

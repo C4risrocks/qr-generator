@@ -1,0 +1,38 @@
+[project]
+name = "qrgen"
+version = "0.3.0"
+description = "Personalizable QR code generator (CLI + web UI)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "alembic>=1.19.1",
+    "asyncpg>=0.31.0",
+    "fastapi>=0.128.8",
+    "greenlet>=3.5.5",
+    "itsdangerous>=2.2.0",
+    "maxminddb>=3.1.1",
+    "python-multipart>=0.0.32",
+    "qrcode[pil]>=8.2",
+    "sqlalchemy>=2.0.52",
+    "uvicorn>=0.39.0",
+]
+
+[project.scripts]
+qrgen = "qrgen.cli:main"
+qrgen-serve = "qrgen.server:main"
+
+[build-system]
+requires = ["uv_build>=0.11.32,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "aiosqlite>=0.22.1",
+    "httpx2>=2.10.0",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.3",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
