@@ -14,7 +14,7 @@ dependencies = [
     "python-multipart>=0.0.32",
     "qrcode[pil]>=8.2",
     "sqlalchemy>=2.0.52",
-    "uvicorn>=0.39.0",
+    "uvicorn>=0.52.4",
 ]
 
 [project.scripts]
