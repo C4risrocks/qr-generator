@@ -29,7 +29,7 @@ build-backend = "uv_build"
 dev = [
     "aiosqlite>=0.22.1",
     "httpx2>=2.10.0",
-    "pytest>=8.4.2",
+    "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.16.3",
 ]
