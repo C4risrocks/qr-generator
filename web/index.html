@@ -613,6 +613,16 @@
       form.append("box_size", state.box);
       form.append("border", state.border);
       form.append("image_format", state.format);
+      if (state.format === "svg") {
+        // SVG does not support these PNG-only options; omit them instead of
+        // sending values the API would reject with 400. State is preserved
+        // so switching back to PNG restores the previous configuration.
+        form.append("transparent_background", false);
+        form.append("frame_color", "");
+        form.append("title", "");
+        form.append("subtitle", "");
+        return form;
+      }
       if (state.logoFile) form.append("logo", state.logoFile);
       form.append("logo_ratio", state.logoRatio);
       form.append("transparent_background", state.transparent);

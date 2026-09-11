@@ -82,6 +82,14 @@ STYLE_INFO: tuple[StyleInfo, ...] = (
 )
 STYLES = tuple(info.id for info in STYLE_INFO)
 STYLE_LABELS = {info.id: info.label for info in STYLE_INFO}
+SVG_CAPABLE_STYLES = frozenset(info.id for info in STYLE_INFO if info.svg)
+
+
+def _preview_style(style: str, svg_mode: bool) -> str:
+    """Style actually rendered in previews, mirroring the SVG export fallback."""
+    if svg_mode and style not in SVG_CAPABLE_STYLES:
+        return STYLE_SQUARE
+    return style
 
 GRADIENT_INFO = (
     {"id": GRADIENT_NONE, "label": "Sólido"},
@@ -534,11 +542,20 @@ def generate_previews(config: QRConfig) -> tuple[list[Preview], Preview, tuple[s
     The gallery thumbnails always use a fixed size and no frame or text, while
     the selected preview applies the real style, frame, title, subtitle, border
     and a capped box size so it matches the final download visually.
+
+    When SVG output is requested, thumbnails use the same fallbacks as the
+    real SVG export (plain squares for unsupported styles, solid foreground
+    for gradients) and report the same warnings, so the preview never shows
+    something the download cannot produce.
     """
     if config.style not in STYLES:
         raise InvalidInput(
             f"unknown style {config.style!r}; choose from: {', '.join(STYLES)}"
         )
+    # Validate the requested configuration as-is (SVG/PNG-only rules, sizes),
+    # so previews and downloads accept and reject the same inputs.
+    _parse_config(config)
+    svg_mode = config.image_format == SVG
     base = replace(
         config,
         style=STYLE_SQUARE,
@@ -550,19 +567,31 @@ def generate_previews(config: QRConfig) -> tuple[list[Preview], Preview, tuple[s
         subtitle="",
     )
     fg, bg, gt, warnings = _parse_config(base)
+    warnings = list(warnings)
+    if svg_mode:
+        if config.style not in SVG_CAPABLE_STYLES:
+            warnings.append(
+                f"style {STYLE_LABELS[config.style]} is not available in SVG; using plain squares"
+            )
+        if config.gradient != GRADIENT_NONE:
+            warnings.append("gradients are not available in SVG; using solid foreground")
+            gt = fg
     error_correction = _resolve_error_correction(base, warnings)
     qr = _build_matrix(base, error_correction)
 
     previews = [
         Preview(
             style=style,
-            content=_png_bytes(_render_png(qr, replace(base, style=style), fg, bg, gt)),
+            content=_png_bytes(
+                _render_png(qr, replace(base, style=_preview_style(style, svg_mode)), fg, bg, gt)
+            ),
         )
         for style in STYLES
     ]
 
     selected_config = replace(
         config,
+        style=_preview_style(config.style, svg_mode),
         image_format=PNG,
         box_size=min(max(config.box_size, 5), 12),
     )

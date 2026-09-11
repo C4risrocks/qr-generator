@@ -37,13 +37,17 @@ services:
       RATE_LIMIT_PREVIEWS_PER_DAY: ${RATE_LIMIT_PREVIEWS_PER_DAY:-500}
       RATE_LIMIT_WINDOW_RETENTION_HOURS: ${RATE_LIMIT_WINDOW_RETENTION_HOURS:-48}
       INPUT_RETENTION_DAYS: ${INPUT_RETENTION_DAYS:-30}
+      MAX_INFLIGHT_BODY_BYTES: ${MAX_INFLIGHT_BODY_BYTES:-33554432}
+      # Trust X-Forwarded-For only from these proxies (empty = direct peer).
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-}
     ports:
       - "127.0.0.1:8000:8000"
     restart: unless-stopped
     init: true
     read_only: true
     tmpfs:
-      - /tmp
+      # Bounded: request bodies are spooled here (see MAX_INFLIGHT_BODY_BYTES).
+      - /tmp:size=64m
     cap_drop:
       - ALL
     security_opt:

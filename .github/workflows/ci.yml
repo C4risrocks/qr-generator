@@ -92,6 +92,7 @@ jobs:
           done
           curl -sf http://127.0.0.1:8000/healthz | grep -q '"status":"ok"'
           curl -sf http://127.0.0.1:8000/readyz | grep -q '"status":"ok"'
+          curl -sf http://127.0.0.1:8000/version | grep -q "${{ github.sha }}"
           curl -sf http://127.0.0.1:8000/ | grep -q "QR Studio"
           curl -sf http://127.0.0.1:8000/api/catalog -o /dev/null
           curl -sf -F "data=https://ejemplo.com" http://127.0.0.1:8000/api/generate -o /dev/null

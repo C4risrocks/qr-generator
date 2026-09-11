@@ -66,7 +66,8 @@ async def test_endpoints_have_independent_limits(monkeypatch) -> None:
 async def test_cleanup_removes_expired_rows(monkeypatch) -> None:
     monkeypatch.setattr(rate_limit, "RATE_LIMIT_WINDOW_RETENTION_HOURS", 48)
     monkeypatch.setattr(rate_limit, "INPUT_RETENTION_DAYS", 30)
-    today = datetime.now(timezone.utc).date()
+    now = datetime.now(timezone.utc)
+    today = now.date()
     async with db.session_factory()() as session:
         client = Client(ip_address=IP, user_agent=UA)
         session.add(client)
@@ -77,6 +78,7 @@ async def test_cleanup_removes_expired_rows(monkeypatch) -> None:
                 endpoint="generate",
                 window_date=today - timedelta(days=5),
                 request_count=10,
+                created_at=now - timedelta(days=5),
             )
         )
         session.add(
@@ -130,16 +132,15 @@ async def test_cleanup_keeps_fresh_rows() -> None:
 
 
 async def test_cleanup_retention_hours_are_exact(monkeypatch) -> None:
-    """Hourly retentions must not truncate to whole days.
+    """Hourly window retention compares real timestamps, not whole days.
 
-    With "now" frozen at 00:30 UTC and a 36 h retention, the cutoff day is
-    two days ago, so a window from that day must be kept. Subtracting
-    ``timedelta(hours=36)`` from a date truncates to one day and would
-    wrongly delete it.
+    With "now" frozen and a 36 h retention, a window created 30 h ago is
+    kept while one created 40 h ago is deleted, even though both fall on
+    recent calendar days.
     """
     import qrgen.rate_limit as rl
 
-    fixed_now = datetime(2026, 9, 10, 0, 30, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
 
     class FrozenDateTime(datetime):
         @classmethod
@@ -149,6 +150,7 @@ async def test_cleanup_retention_hours_are_exact(monkeypatch) -> None:
     monkeypatch.setattr(rl, "datetime", FrozenDateTime)
     monkeypatch.setattr(rl, "RATE_LIMIT_WINDOW_RETENTION_HOURS", 36)
     monkeypatch.setattr(rl, "INPUT_RETENTION_DAYS", 30)
+    today = fixed_now.date()
     async with db.session_factory()() as session:
         client = Client(ip_address=IP, user_agent=UA)
         session.add(client)
@@ -157,8 +159,18 @@ async def test_cleanup_retention_hours_are_exact(monkeypatch) -> None:
             RateLimitWindow(
                 client_id=client.id,
                 endpoint="generate",
-                window_date=fixed_now.date() - timedelta(days=2),
+                window_date=today - timedelta(days=1),
                 request_count=1,
+                created_at=fixed_now - timedelta(hours=30),
+            )
+        )
+        session.add(
+            RateLimitWindow(
+                client_id=client.id,
+                endpoint="previews",
+                window_date=today - timedelta(days=2),
+                request_count=1,
+                created_at=fixed_now - timedelta(hours=40),
             )
         )
         await session.commit()
@@ -167,7 +179,7 @@ async def test_cleanup_retention_hours_are_exact(monkeypatch) -> None:
 
     async with db.session_factory()() as session:
         windows = (await session.execute(select(RateLimitWindow))).scalars().all()
-        assert len(windows) == 1
+        assert [w.endpoint for w in windows] == ["generate"]
 
 
 def test_endpoint_for_path() -> None:

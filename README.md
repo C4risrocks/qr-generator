@@ -97,8 +97,10 @@ La aplicación usa PostgreSQL para dos propósitos:
   únicamente después de generar correctamente el QR y nunca aparece en logs.
 
 Tablas: `clients`, `rate_limit_windows`, `qr_inputs`. Retención:
-ventanas de rate limit 48 h, inputs `INPUT_RETENTION_DAYS=30` (limpieza
-automática cada 15 min). Los clientes persisten.
+ventanas de rate limit 48 h desde su creación, inputs
+`INPUT_RETENTION_DAYS=30` (limpieza automática cada 15 min). Las ventanas
+anteriores a la migración `0002` se fechan a la medianoche UTC de su día.
+Los clientes persisten.
 
 No se almacena información del navegador con fines de analítica más allá de
 lo descrito (IP, User-Agent y Accept-Language para el rate limit).
@@ -154,6 +156,12 @@ los estilos no disponibles caen a color sólido o cuadrados con aviso.
 - Imagen runtime slim sin `uv`, tests ni herramientas de desarrollo.
 - Imágenes base y versión de `uv` fijadas por digest.
 - Usuario no root, `HEALTHCHECK` contra `/healthz`.
+- El commit se hornea en `/app/GIT_SHA` durante el build: el contexto se
+  monta de solo lectura únicamente para ese paso (nunca entra en capas ni
+  caché de imagen) y `GET /version` lo expone. Con un checkout Git en el
+  contexto (CI y Dokploy) se detecta solo; sin `.git` puede pasarse
+  `--build-arg GIT_SHA=<sha>`. El runtime de producción falla rápido si el
+  SHA no puede verificarse.
 - Arranque: `scripts/start.sh` espera la BD, aplica migraciones
   (`qrgen migrate`) y sirve con `qrgen-serve`.
 
@@ -168,7 +176,7 @@ docker compose up --build
 ```
 
 Incluye el servicio `db` (Postgres con volumen y healthcheck), migraciones
-automáticas, `read_only`, `tmpfs` para `/tmp`, `cap_drop: [ALL]` y
+automáticas, `read_only`, `tmpfs` para `/tmp` (64 MB), `cap_drop: [ALL]` y
 `no-new-privileges`. El healthcheck de la aplicación usa `/readyz`.
 
 ### Variables de entorno
@@ -181,16 +189,32 @@ automáticas, `read_only`, `tmpfs` para `/tmp`, `cap_drop: [ALL]` y
 | `RATE_LIMIT_PREVIEWS_PER_DAY` | Límite diario de `/api/previews` | `500` |
 | `RATE_LIMIT_WINDOW_RETENTION_HOURS` | Retención de ventanas | `48` |
 | `INPUT_RETENTION_DAYS` | Retención de inputs | `30` |
+| `MAX_INFLIGHT_BODY_BYTES` | Bytes de cuerpos en spool a la vez (multipart ×2) | `33554432` |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH` | Cuenta del panel | — |
 | `SESSION_SECRET` | Firma de sesiones | generado si falta |
 | `SESSION_HTTPS_ONLY` | Cookie solo por HTTPS | `false` |
+| `FORWARDED_ALLOW_IPS` | Proxies de confianza para `X-Forwarded-For` | vacío (peer directo) |
 | `GEOIP_DB_PATH` | Base GeoLite2 opcional para país | — |
 
 ### Protección de los endpoints
 
 - Rate limit diario por cliente (IP+UA) en `/api/generate` y `/api/previews`
-  (responde `429` con `Retry-After`).
-- Límite de cuerpo de petición: 6 MB (responde `413`).
+  (responde `429` con `Retry-After`). La IP se toma del peer directo, salvo
+  que llegue desde un proxy listado en `FORWARDED_ALLOW_IPS` (solo redes de
+  proxies confiables; nunca `0.0.0.0/0`).
+- Límite de cuerpo de petición: 6 MB. Un `Content-Length` declarado por
+  encima del límite responde `413` sin leer el cuerpo. El resto se recibe
+  en un spool temporal acotado (≤64 KB en memoria, luego `/tmp`) y se
+  rechaza con `413` al superar el límite, antes de consumir rate limit.
+  El total en vuelo está acotado por `MAX_INFLIGHT_BODY_BYTES` (responde
+  `503` con `Retry-After` si se satura; los cuerpos multipart cuentan
+  doble, porque el parser de formularios puede volcar las partes a `/tmp`
+  además del spool del middleware) y en Compose `/tmp` está limitado a
+  64 MB. El contador es por proceso y el servidor ejecuta un único worker
+  Uvicorn por contenedor; para escalar se usan réplicas separadas (cada
+  una con su propio tmpfs y límite), no `--workers > 1`. Los campos
+  urlencoded individuales mayores a 1 MB que rechaza el parser de
+  formularios responden `400` aunque el cuerpo quepa en el límite global.
 - Texto/archivo limitado a 2048 caracteres; archivos binarios o no UTF-8
   rechazados; logo máx. 5 MB y 1024 × 1024 px.
 
@@ -204,10 +228,24 @@ Modo recomendado: **Application** desde Git con build `Dockerfile`.
 4. Crea un servicio **PostgreSQL** gestionado y usa su `DATABASE_URL`.
 5. Asigna el dominio (HTTPS automático con Traefik).
 6. Healthcheck: `/healthz` (liveness) y `/readyz` (readiness con BD).
-7. Aplica el endurecimiento de `compose.yaml` en los ajustes avanzados:
-   filesystem de solo lectura, `tmpfs` en `/tmp`, `cap_drop: [ALL]` y
-   `no-new-privileges`.
-8. Configura las variables de entorno y secretos:
+7. Si Dokploy está detrás de otro proxy, configura sus `forwardedHeaders`
+  con `trustedIPs` limitadas a la red Docker de Traefik (nunca rangos
+  abiertos) para que `X-Forwarded-For` no sea falsificable:
+
+```yaml
+entryPoints:
+  websecure:
+    forwardedHeaders:
+      trustedIPs: ["172.18.0.0/16"]
+      insecure: false
+```
+
+8. Aplica el endurecimiento de `compose.yaml` en los ajustes avanzados:
+   filesystem de solo lectura, `tmpfs` en `/tmp` con `size=64m`,
+   `cap_drop: [ALL]` y `no-new-privileges`. No sobrescribas el comando con
+   `--workers > 1`: el límite en vuelo es por proceso y varios workers
+   compartirían el mismo tmpfs; escala con réplicas separadas.
+9. Configura las variables de entorno y secretos:
 
 ```text
 DATABASE_URL
@@ -218,9 +256,11 @@ RATE_LIMIT_GENERATE_PER_DAY
 RATE_LIMIT_PREVIEWS_PER_DAY
 INPUT_RETENTION_DAYS
 SESSION_HTTPS_ONLY=true
+FORWARDED_ALLOW_IPS=<red Traefik/Docker, p. ej. 172.18.0.0/16>
+MAX_INFLIGHT_BODY_BYTES=33554432
 ```
 
-9. Guarda en GitHub los secretos para el despliegue automático:
+10. Guarda en GitHub los secretos para el despliegue automático:
 
 ```text
 DOKPLOY_URL
@@ -229,7 +269,7 @@ DOKPLOY_APPLICATION_ID
 PRODUCTION_URL
 ```
 
-10. Desactiva el auto-deploy de Dokploy: el workflow de GitHub es quien
+11. Desactiva el auto-deploy de Dokploy: el workflow de GitHub es quien
     dispara el despliegue solo tras CI exitoso en `main`.
 
 ## CI/CD
@@ -240,15 +280,29 @@ PRODUCTION_URL
   previews, login admin) y escaneo con Trivy (HIGH/CRITICAL). Concurrencia
   por rama con cancelación de ejecuciones antiguas.
 - **Deploy** (`.github/workflows/deploy-dokploy.yml`): se activa únicamente tras
-  un CI exitoso causado por un push real a `main` del repositorio correcto
-  (o manualmente), llama a la API de Dokploy y espera a que `/healthz`
-  responda. Concurrencia de despliegue sin cancelar (cola).
+  un CI exitoso causado por un push real a `main` del repositorio correcto.
+  Los lanzamientos manuales solo se permiten desde `main` y exigen que el
+  commit tenga un CI exitoso; además se aborta si `main` avanzó después del
+  CI validado. Llama a la API de Dokploy y acepta el despliegue cuando
+  `/version` sirve cualquier commit con CI verde de `main` (fail-closed:
+  un push intermedio sin CI nunca se da por bueno) y `/healthz` y
+  `/readyz` responden `ok`. El commit se hornea en la imagen durante el
+  build (`scripts/bake-git-sha.py`), sin necesidad de build args dinámicos.
+  Concurrencia de despliegue sin cancelar (cola).
 - **Dependabot**: actualizaciones semanales de actions, imágenes Docker y
   dependencias Python.
 
 Alternativa: publicar la imagen en GHCR desde CI (build único, digest
-inmutable, rollback por digest) y hacer que Dokploy la descargue. Recomendada
-como evolución cuando se necesiten releases versionadas.
+inmutable, rollback por digest) y hacer que Dokploy la descargue. El
+workflow opcional `publish.yml` (manual o tags `v*`) exige un CI verde en
+`main` para el commit antes de publicar, sube
+`ghcr.io/<owner>/<repo>:sha-<commit>` (y el tag de versión) sin enviar el
+historial `.git` al builder y reporta el digest en el job. Para usarlo,
+cambia la Application de Dokploy a fuente **Docker Image** apuntando a ese
+tag o digest (con credenciales de registry si es privado); al ser un tag
+inmutable por commit, actualizar la imagen en Dokploy es un paso manual por
+release. El workflow de deploy sigue igual y verifica `/version`.
+Recomendada cuando se necesiten releases versionadas o rollback exacto.
 
 ## Notas
 
@@ -257,6 +311,11 @@ como evolución cuando se necesiten releases versionadas.
 - El logo, el fondo transparente, el marco y el texto solo se admiten en PNG.
 - El contenido de los inputs se guarda en `qr_inputs` con hash SHA-256 y se
   elimina según `INPUT_RETENTION_DAYS`.
+- SQLite (solo desarrollo/tests) replica el esquema de PostgreSQL; las
+  migraciones le aplican las mismas restricciones (`created_at NOT NULL`).
+- Las migraciones desplegadas se consideran inmutables. La revisión `0001`
+  se finalizó antes del primer despliegue: no existe ningún entorno que
+  haya aplicado su versión previa.
 
 ## Desarrollo
 

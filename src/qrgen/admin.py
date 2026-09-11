@@ -14,6 +14,7 @@ from sqlalchemy import case, func, select
 from qrgen import db
 from qrgen.db import Client, QrInput, RateLimitWindow
 from qrgen.passwords import admin_configured, verify_password
+from qrgen.proxy import client_ip
 from qrgen.rate_limit import (
     ENDPOINT_LIMITS,
     INPUT_RETENTION_DAYS,
@@ -72,7 +73,7 @@ async def admin_login(
     username: str = Form(...),
     password: str = Form(...),
 ) -> RedirectResponse:
-    ip = request.client.host if request.client else "unknown"
+    ip = client_ip(request)
     if not _login_allowed(ip):
         raise HTTPException(status_code=429, detail="too many login attempts; try again later")
     if not admin_configured():

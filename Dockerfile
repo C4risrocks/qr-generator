@@ -22,8 +22,23 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --locked --no-install-project --no-editable
 
-# Copy the rest of the project and install it (non-editable, no dev group)
-COPY . .
+# Copy only what the runtime needs; `.git` is deliberately never copied, so
+# it cannot leak into any image layer or BuildKit cache layer.
+COPY pyproject.toml uv.lock README.md alembic.ini ./
+COPY src ./src
+COPY web ./web
+COPY alembic ./alembic
+COPY scripts ./scripts
+
+# Bake the exact commit into /app/GIT_SHA so /version can report it without
+# relying on build args (Dokploy builds don't receive dynamic ones). The
+# whole build context is bind-mounted read-only for this single instruction
+# only, so it never becomes a layer; the script reads `.git` from there if
+# present (CI, Dokploy and local checkouts all provide it) and otherwise
+# falls back to the GIT_SHA build arg (or "unknown").
+ARG GIT_SHA=unknown
+RUN --mount=type=bind,source=.,target=/ctx,ro \
+    GIT_DIR=/ctx/.git python3 scripts/bake-git-sha.py > /app/GIT_SHA
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-editable
@@ -38,11 +53,16 @@ ENV PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH" \
     HOST=0.0.0.0 \
     PORT=8000 \
-    QRGEN_WEB_DIR=/app/web
+    QRGEN_WEB_DIR=/app/web \
+    QRGEN_REQUIRE_GIT_SHA=true
 
 # Metadata for the image (set GIT_SHA at build time, e.g. in CI)
 ARG GIT_SHA=unknown
 ARG BUILD_DATE=unknown
+# Also exposed at runtime so /version (and the deploy workflow) can verify
+# the exact commit serving traffic.
+ENV QRGEN_GIT_SHA=${GIT_SHA:-unknown} \
+    QRGEN_BUILD_DATE=${BUILD_DATE:-unknown}
 LABEL org.opencontainers.image.title="QR Studio" \
       org.opencontainers.image.description="Personalizable QR code generator (CLI + web UI)" \
       org.opencontainers.image.version="0.3.0" \

@@ -176,19 +176,20 @@ async def check_and_record(
 
 
 async def cleanup_once() -> None:
-    """Delete expired rate-limit windows and old inputs."""
+    """Delete expired rate-limit windows and old inputs.
+
+    Both cutoffs compare real timestamps in UTC, so hourly retentions are
+    exact and the indexed ``created_at`` columns are used directly.
+    """
     async with db.session_factory()() as session:
         now = datetime.now(timezone.utc)
-        # Compute the cutoff from a datetime so hourly retentions are exact;
-        # subtracting a timedelta with hours from a date silently truncates
-        # to whole days.
-        window_cutoff = (now - timedelta(hours=RATE_LIMIT_WINDOW_RETENTION_HOURS)).date()
+        window_cutoff = now - timedelta(hours=RATE_LIMIT_WINDOW_RETENTION_HOURS)
         await session.execute(
-            delete(RateLimitWindow).where(RateLimitWindow.window_date < window_cutoff)
+            delete(RateLimitWindow).where(RateLimitWindow.created_at < window_cutoff)
         )
-        input_cutoff = (now - timedelta(days=INPUT_RETENTION_DAYS)).date()
+        input_cutoff = now - timedelta(days=INPUT_RETENTION_DAYS)
         await session.execute(
-            delete(QrInput).where(func.date(QrInput.created_at) < input_cutoff)
+            delete(QrInput).where(QrInput.created_at < input_cutoff)
         )
         await session.commit()
 

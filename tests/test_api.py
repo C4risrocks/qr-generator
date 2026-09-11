@@ -24,6 +24,213 @@ def test_body_too_large_rejected(monkeypatch) -> None:
     assert res.status_code == 413
 
 
+def test_declared_content_length_rejected_without_reading(monkeypatch) -> None:
+    """A declared oversized body is rejected before any parsing: the
+    response must not depend on Starlette's per-field parser limits."""
+    from qrgen import server
+
+    monkeypatch.setattr(server, "MAX_BODY_BYTES", 100)
+    res = client.post(
+        "/api/generate",
+        content=b"data=" + b"x" * 200,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert res.status_code == 413
+    assert "too large" in res.json()["detail"]
+
+
+def test_chunked_body_too_large_rejected(monkeypatch) -> None:
+    """Bodies without Content-Length (chunked) must also hit the limit."""
+    from qrgen import server
+
+    monkeypatch.setattr(server, "MAX_BODY_BYTES", 100)
+
+    def chunks():
+        yield b"data="
+        yield b"x" * 200
+
+    res = client.post(
+        "/api/generate",
+        content=chunks(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert res.status_code == 413
+
+
+def test_chunked_body_within_limit_passes_through() -> None:
+    def chunks():
+        yield b"data="
+        yield b"hola-chunked"
+
+    res = client.post(
+        "/api/generate",
+        content=chunks(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert res.status_code == 200
+    assert res.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_oversized_chunked_body_does_not_consume_rate_limit(monkeypatch) -> None:
+    """Size rejection must happen before the daily counter is recorded."""
+    from qrgen import rate_limit, server
+
+    monkeypatch.setattr(server, "MAX_BODY_BYTES", 100)
+    monkeypatch.setattr(rate_limit, "ENDPOINT_LIMITS", {"generate": 1, "previews": 500})
+
+    def chunks():
+        yield b"data="
+        yield b"x" * 200
+
+    oversized = client.post(
+        "/api/generate",
+        content=chunks(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert oversized.status_code == 413
+
+    first = client.post("/api/generate", data={"data": "valid"})
+    second = client.post("/api/generate", data={"data": "valid"})
+    assert first.status_code == 200
+    assert second.status_code == 429
+
+
+def test_many_small_chunks_too_large_rejected(monkeypatch) -> None:
+    """The limit applies to the running total, not to individual chunks."""
+    from qrgen import server
+
+    monkeypatch.setattr(server, "MAX_BODY_BYTES", 100)
+
+    def chunks():
+        yield b"data="
+        for _ in range(200):
+            yield b"x"
+
+    res = client.post(
+        "/api/generate",
+        content=chunks(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert res.status_code == 413
+
+
+def test_inflight_cap_returns_503_and_releases(monkeypatch) -> None:
+    """A saturated spool budget answers 503 with Retry-After, and the
+    reserved bytes are released afterwards so later requests succeed."""
+    from qrgen import server
+
+    monkeypatch.setattr(server, "MAX_BODY_BYTES", 10_000)
+    monkeypatch.setattr(server, "MAX_INFLIGHT_BODY_BYTES", 10)
+    assert server._inflight_body_bytes == 0
+
+    def chunks():
+        yield b"data="
+        yield b"x" * 20
+
+    res = client.post(
+        "/api/generate",
+        content=chunks(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert res.status_code == 503
+    assert int(res.headers["retry-after"]) > 0
+    assert server._inflight_body_bytes == 0
+
+    ok = client.post("/api/generate", data={"data": "hola"})
+    assert ok.status_code == 200
+    assert server._inflight_body_bytes == 0
+
+
+async def test_concurrent_multipart_obeys_inflight_cap(monkeypatch) -> None:
+    """Concurrent multipart uploads count each byte twice (the form parser
+    may spool parts separately), so the global cap still answers 503 to the
+    request that would exceed it and releases the budget afterwards."""
+    import asyncio
+
+    import httpx2 as httpx
+
+    from qrgen import server
+
+    monkeypatch.setattr(server, "MAX_BODY_BYTES", 10_000)
+    monkeypatch.setattr(server, "MAX_INFLIGHT_BODY_BYTES", 250)
+    assert server._inflight_body_bytes == 0
+
+    first = b"--BOUND\r\nContent-Disposition: form-data; name=\"data\"\r\n\r\n"
+    parked = 0
+    both_parked = asyncio.Event()
+    go = asyncio.Event()
+
+    async def body():
+        nonlocal parked
+        yield first
+        parked += 1
+        if parked == 2:
+            both_parked.set()
+        await go.wait()
+        for _ in range(10):
+            yield b"x"
+        yield b"\r\n--BOUND--\r\n"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        async def post():
+            return await http.post(
+                "/api/generate",
+                content=body(),
+                headers={"Content-Type": "multipart/form-data; boundary=BOUND"},
+            )
+
+        first_req = asyncio.create_task(post())
+        second_req = asyncio.create_task(post())
+        await asyncio.wait_for(both_parked.wait(), timeout=5)
+        go.set()
+        res1, res2 = await asyncio.gather(first_req, second_req)
+
+        assert 503 in {res1.status_code, res2.status_code}
+        assert server._inflight_body_bytes == 0
+
+        ok = await http.post("/api/generate", data={"data": "hola"})
+        assert ok.status_code == 200
+        assert server._inflight_body_bytes == 0
+
+
+def test_mixed_case_multipart_content_type_counts_double(monkeypatch) -> None:
+    """The double spool accounting must not depend on Content-Type casing."""
+    from qrgen import server
+
+    monkeypatch.setattr(server, "MAX_BODY_BYTES", 10_000)
+    monkeypatch.setattr(server, "MAX_INFLIGHT_BODY_BYTES", 100)
+    assert server._inflight_body_bytes == 0
+
+    def chunks():
+        yield b"--BOUND\r\nContent-Disposition: form-data; name=\"data\"\r\n\r\n"
+        yield b"x"
+        yield b"\r\n--BOUND--\r\n"
+
+    res = client.post(
+        "/api/generate",
+        content=chunks(),
+        headers={"Content-Type": "Multipart/Form-Data; boundary=BOUND"},
+    )
+    assert res.status_code == 503
+    assert server._inflight_body_bytes == 0
+
+
+def test_server_run_uses_single_worker(monkeypatch) -> None:
+    """The in-flight spool cap is process-wide, so the server must run one
+    Uvicorn worker per container; scale out with replicas instead."""
+    from qrgen import server
+
+    calls = {}
+
+    def fake_run(app, host, port, workers):
+        calls["workers"] = workers
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    server.run(host="127.0.0.1", port=8123)
+    assert calls["workers"] == 1
+
+
 def test_rate_limit_enforced(monkeypatch) -> None:
     from qrgen import rate_limit
 
@@ -194,6 +401,37 @@ def test_previews_rejects_bad_style() -> None:
     assert res.status_code == 400
 
 
+def test_previews_svg_reports_fallback_warnings() -> None:
+    """In SVG mode previews must mirror the export fallbacks (squares for
+    unsupported styles, solid foreground for gradients) and warn about them."""
+    res = client.post(
+        "/api/previews",
+        data={
+            "data": "https://example.com",
+            "style": "rounded",
+            "image_format": "svg",
+            "gradient": "linear-h",
+            "gradient_to": "#0000ff",
+        },
+    )
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload["selected"]["style"] == "rounded"
+    assert any("not available in SVG" in w for w in payload["warnings"])
+    assert any("gradients are not available in SVG" in w for w in payload["warnings"])
+
+
+def test_previews_svg_rejects_png_only_options() -> None:
+    """Previews and downloads must accept/reject the same inputs."""
+    big_logo = Image.new("RGB", (64, 64), (0, 255, 0))
+    res = client.post(
+        "/api/previews",
+        data={"data": "https://example.com", "image_format": "svg"},
+        files={"logo": ("logo.png", png_bytes(big_logo), "image/png")},
+    )
+    assert res.status_code == 400
+
+
 WEB_PAYLOAD = {
     "data": "https://ejemplo.com",
     "style": "dots",
@@ -323,6 +561,13 @@ def test_healthz() -> None:
     res = client.get("/healthz")
     assert res.status_code == 200
     assert res.json() == {"status": "ok"}
+
+
+def test_version_shape() -> None:
+    res = client.get("/version")
+    assert res.status_code == 200
+    payload = res.json()
+    assert {"version", "git_sha", "build_date"} <= set(payload)
 
 
 def test_generate_rejects_too_long_data() -> None:

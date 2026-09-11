@@ -8,7 +8,8 @@ import io
 import logging
 import os
 import secrets
-from contextlib import asynccontextmanager
+import tempfile
+from contextlib import asynccontextmanager, closing
 from typing import Annotated
 
 from fastapi import (
@@ -44,15 +45,167 @@ from qrgen.core import (
     validate_logo,
 )
 from qrgen.inputs import InputPayload
+from qrgen.proxy import client_ip
 from qrgen.webassets import WEB_DIR
 
 logger = logging.getLogger("qrgen.server")
 
 MAX_LOGO_BYTES = 5 * 1024 * 1024
 MAX_BODY_BYTES = 6 * 1024 * 1024
+# Global cap on bytes held in request spools at any moment (avoids filling
+# the tmpfs with concurrent 6 MB uploads). The counter is per process and
+# the server deliberately runs a single worker, so the cap matches the
+# per-container tmpfs budget; scale out with container replicas instead of
+# extra workers. Excess requests get 503.
+MAX_INFLIGHT_BODY_BYTES = int(
+    os.environ.get("MAX_INFLIGHT_BODY_BYTES", str(32 * 1024 * 1024))
+)
+_inflight_body_bytes = 0
 
 SESSION_SECRET = os.environ.get("SESSION_SECRET") or secrets.token_urlsafe(32)
 SESSION_HTTPS_ONLY = os.environ.get("SESSION_HTTPS_ONLY", "false").lower() == "true"
+
+
+class BodyLimitMiddleware:
+    """Stream, cap and replay request bodies before application work.
+
+    Bodies are spooled to memory only up to a small threshold and then to
+    the temporary filesystem. This lets the middleware reject oversized
+    chunked requests before they consume rate-limit quota, without keeping
+    the full body in RAM. The completed body is replayed to FastAPI after
+    the size and rate-limit checks pass.
+
+    A process-wide in-flight cap (``MAX_INFLIGHT_BODY_BYTES``) bounds how
+    many spooled bytes may exist at once across requests; beyond it the
+    server answers 503 with ``Retry-After`` instead of exhausting the
+    tmpfs. The server runs a single worker per container so the cap
+    matches the per-container tmpfs budget; scale out with container
+    replicas instead of extra workers. Multipart bodies count double,
+    because the form parser may spool file parts to the tmpfs
+    independently of this spool.
+    """
+
+    def __init__(self, app, max_bytes: int | None = None) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        global _inflight_body_bytes
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        limit = self.max_bytes if self.max_bytes is not None else MAX_BODY_BYTES
+
+        length: int | None = None
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                try:
+                    length = int(value)
+                except ValueError:
+                    length = None
+                break
+        if length is not None and length > limit:
+            response = JSONResponse(
+                {"detail": "request body too large"},
+                status_code=413,
+            )
+            await response(scope, receive, send)
+            return
+
+        reserved = 0
+        # Multipart parsers can spool file parts to disk themselves while
+        # the full body is still held in the external spool, so every
+        # multipart byte may occupy the tmpfs twice. Count multipart bytes
+        # twice in the in-flight cap so the real peak stays bounded. The
+        # media type is compared case-insensitively and without parameters.
+        multipart = any(
+            name == b"content-type"
+            and value.split(b";", 1)[0].strip().lower() == b"multipart/form-data"
+            for name, value in scope.get("headers", [])
+        )
+        try:
+            with closing(
+                tempfile.SpooledTemporaryFile(max_size=64 * 1024, mode="w+b")
+            ) as body:
+                received = 0
+                while True:
+                    message = await receive()
+                    if message["type"] != "http.request":
+                        return
+                    chunk = message.get("body", b"")
+                    received += len(chunk)
+                    if received > limit:
+                        response = JSONResponse(
+                            {"detail": "request body too large"},
+                            status_code=413,
+                        )
+                        await response(scope, receive, send)
+                        return
+                    cost = len(chunk) * (2 if multipart else 1)
+                    if _inflight_body_bytes + cost > MAX_INFLIGHT_BODY_BYTES:
+                        response = JSONResponse(
+                            {"detail": "server busy; try again later"},
+                            status_code=503,
+                            headers={"Retry-After": "5"},
+                        )
+                        await response(scope, receive, send)
+                        return
+                    _inflight_body_bytes += cost
+                    reserved += cost
+                    body.write(chunk)
+                    if not message.get("more_body"):
+                        break
+
+                if (
+                    scope["method"] == "POST"
+                    and rate_limit.endpoint_for_path(scope["path"]) is not None
+                ):
+                    if db.is_configured():
+                        try:
+                            request = Request(scope)
+                            ip = client_ip(request)
+                            user_agent = request.headers.get("user-agent", "")
+                            accept_language = request.headers.get("accept-language", "")
+                            allowed, retry_after, client_id = (
+                                await rate_limit.check_and_record(
+                                    ip, user_agent, accept_language, scope["path"]
+                                )
+                            )
+                            if client_id is not None:
+                                scope.setdefault("state", {})["client_id"] = client_id
+                            if not allowed:
+                                response = JSONResponse(
+                                    {"detail": "rate limit exceeded; try again later"},
+                                    status_code=429,
+                                    headers={"Retry-After": str(retry_after)},
+                                )
+                                await response(scope, receive, send)
+                                return
+                        except Exception:  # noqa: BLE001
+                            rate_limit.warn_once(
+                                "ratelimit", "rate limit check failed; allowing request"
+                            )
+                    else:
+                        rate_limit.warn_once(
+                            "no_db",
+                            "DATABASE_URL is not configured; rate limiting disabled",
+                        )
+
+                body.seek(0)
+
+                async def replay():
+                    chunk = body.read(64 * 1024)
+                    if chunk:
+                        return {
+                            "type": "http.request",
+                            "body": chunk,
+                            "more_body": True,
+                        }
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+                await self.app(scope, replay, send)
+        finally:
+            _inflight_body_bytes -= reserved
 
 
 @asynccontextmanager
@@ -77,45 +230,6 @@ app = FastAPI(
 )
 
 
-@app.middleware("http")
-async def guard_request(request: Request, call_next):
-    """Rate limit CPU-heavy endpoints with the daily DB counter and cap bodies."""
-    if request.method == "POST" and rate_limit.endpoint_for_path(request.url.path) is not None:
-        if db.is_configured():
-            try:
-                ip = request.client.host if request.client else "unknown"
-                user_agent = request.headers.get("user-agent", "")
-                accept_language = request.headers.get("accept-language", "")
-                allowed, retry_after, client_id = await rate_limit.check_and_record(
-                    ip, user_agent, accept_language, request.url.path
-                )
-                if client_id is not None:
-                    request.state.client_id = client_id
-                if not allowed:
-                    return JSONResponse(
-                        {"detail": "rate limit exceeded; try again later"},
-                        status_code=429,
-                        headers={"Retry-After": str(retry_after)},
-                    )
-            except Exception:  # noqa: BLE001
-                rate_limit.warn_once("ratelimit", "rate limit check failed; allowing request")
-        else:
-            rate_limit.warn_once("no_db", "DATABASE_URL is not configured; rate limiting disabled")
-
-    length = request.headers.get("content-length")
-    if length:
-        try:
-            if int(length) > MAX_BODY_BYTES:
-                return JSONResponse(
-                    {"detail": "request body too large"},
-                    status_code=413,
-                )
-        except ValueError:
-            pass
-
-    return await call_next(request)
-
-
 app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET,
@@ -123,6 +237,10 @@ app.add_middleware(
     https_only=SESSION_HTTPS_ONLY,
     max_age=60 * 60 * 8,
 )
+
+# Outermost: size is checked and the rate-limit counter is recorded only after
+# the complete, bounded body has been received.
+app.add_middleware(BodyLimitMiddleware)
 
 
 async def _read_logo(logo: UploadFile | None) -> Image.Image | None:
@@ -214,6 +332,27 @@ def index() -> FileResponse:
 def healthz() -> JSONResponse:
     """Lightweight liveness probe; no QR work, no external dependencies."""
     return JSONResponse({"status": "ok"})
+
+
+def _app_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("qrgen")
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+@app.get("/version")
+def version() -> JSONResponse:
+    """Build identity: lets the deploy workflow verify the running commit."""
+    return JSONResponse(
+        {
+            "version": _app_version(),
+            "git_sha": os.environ.get("QRGEN_GIT_SHA", "unknown"),
+            "build_date": os.environ.get("QRGEN_BUILD_DATE", "unknown"),
+        }
+    )
 
 
 @app.get("/readyz")
@@ -365,7 +504,11 @@ def run(host: str | None = None, port: int | None = None) -> int:
     port = port or int(os.environ.get("PORT", "8000"))
 
     print(f"QR Generator web UI: http://{host}:{port}")
-    uvicorn.run(app, host=host, port=port)
+    # Single worker on purpose: MAX_INFLIGHT_BODY_BYTES is a process-wide
+    # counter and the tmpfs budget is per container. Several workers would
+    # each enforce their own cap over the same /tmp. Scale out with
+    # separate container replicas instead.
+    uvicorn.run(app, host=host, port=port, workers=1)
     return 0
 
 

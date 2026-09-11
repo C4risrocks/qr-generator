@@ -1,5 +1,7 @@
-# Version control
-.git
+# Version control: `.git` deliberately stays in the build context because
+# the builder bind-mounts it (read-only, ephemeral) to bake the commit SHA
+# into /app/GIT_SHA. The Dockerfile never COPYs it, so it cannot leak into
+# an image layer. Only the ignore file itself is excluded.
 .gitignore
 
 # Local virtual environment and Python caches

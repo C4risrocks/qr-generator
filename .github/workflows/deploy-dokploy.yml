@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: dokploy-production
@@ -15,17 +16,70 @@ concurrency:
 
 jobs:
   deploy:
-    # Only deploy the exact commit that was tested: a successful CI run on the
-    # default branch of this repository, triggered by a real push.
+    # Automatic deploys only for the exact commit that was tested: a
+    # successful CI run on main, triggered by a real push to this repo.
+    # Manual runs are only allowed from main and must point at a commit
+    # whose CI run succeeded; anything else aborts before touching Dokploy.
     if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch == 'main' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     environment: production
     steps:
+      - name: Resolve target commit
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            SHA=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/commits/main" | jq -r .sha)
+            test -n "$SHA" && test "$SHA" != "null"
+            # Only a successful CI run from a real push to main of this very
+            # repository authorizes the deploy (not PR runs, not forks).
+            curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&branch=main&status=success&per_page=5" \
+              | jq -e --arg repo "${{ github.repository }}" \
+                '.workflow_runs | map(select(
+                  .conclusion == "success"
+                  and .event == "push"
+                  and .head_branch == "main"
+                  and .head_repository.full_name == $repo
+                )) | length > 0' > /dev/null
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Guard against newer pushes
+        run: |
+          TIP=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/commits/main" | jq -r .sha)
+          if [ "$TIP" != "${{ steps.target.outputs.sha }}" ]; then
+            echo "Refusing deploy: main moved from ${{ steps.target.outputs.sha }} to $TIP; wait for its CI run" >&2
+            exit 1
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate secrets
+        run: |
+          for var in DOKPLOY_URL DOKPLOY_API_KEY DOKPLOY_APPLICATION_ID PRODUCTION_URL; do
+            if [ -z "${!var}" ]; then
+              echo "Missing required secret: $var" >&2
+              exit 1
+            fi
+          done
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          DOKPLOY_APPLICATION_ID: ${{ secrets.DOKPLOY_APPLICATION_ID }}
+          PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
+
       - name: Trigger deployment in Dokploy
         run: |
           curl -fsS -X POST "${DOKPLOY_URL}/api/application.deploy" \
@@ -39,14 +93,56 @@ jobs:
 
       - name: Wait for healthy deployment
         run: |
-          for _ in $(seq 1 60); do
-            if curl -sf "${PRODUCTION_URL}/healthz" > /dev/null 2>&1; then
-              echo "Deployment healthy"
-              exit 0
+          # Fail closed: Dokploy builds the branch tip, which may have moved
+          # past the target while CI was running, and a failed build keeps
+          # the previous container serving traffic. The deployment is
+          # accepted only when the running commit proves freshness AND trust:
+          # it must equal the freshly tested target, or differ from the
+          # pre-deploy version while belonging to the CI-tested set. A stale
+          # container can never satisfy this, and untested code neither.
+          hex_sha() {
+            case "$1" in ''|*[!0-9a-f]*) printf '';; *) printf '%s' "$1";; esac
+          }
+          tested() {
+            # Exact lookup for one commit instead of a bounded page of runs,
+            # so a long deployment or many pushes cannot hide a valid SHA.
+            curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$1&event=push&branch=main&status=success&per_page=5" \
+              2>/dev/null | jq -e --arg repo "${{ github.repository }}" '[.workflow_runs[]
+                | select(.conclusion == "success"
+                  and .event == "push"
+                  and .head_branch == "main"
+                  and .head_repository.full_name == $repo)
+                ] | length > 0' > /dev/null
+          }
+          TARGET="${{ steps.target.outputs.sha }}"
+          BEFORE="$(hex_sha "$(curl -sf "${PRODUCTION_URL}/version" 2>/dev/null | jq -r .git_sha 2>/dev/null || true)")"
+          accepted() {
+            # $1=running $2=target $3=before. Accepts the freshly tested
+            # target, or a different commit proven tested — never the stale
+            # pre-deploy version, never untested code.
+            [ -n "$1" ] || return 1
+            [ "$1" = "$2" ] && return 0
+            [ -n "$3" ] || return 1
+            [ "$1" != "$3" ] || return 1
+            tested "$1"
+          }
+          RUNNING=""
+          for _ in $(seq 1 120); do
+            RUNNING="$(hex_sha "$(curl -sf "${PRODUCTION_URL}/version" 2>/dev/null | jq -r .git_sha 2>/dev/null || true)")"
+            if accepted "$RUNNING" "$TARGET" "$BEFORE"; then
+              echo "Running CI-tested commit $RUNNING"
+              break
             fi
             sleep 5
           done
-          echo "Deployment not healthy after 5 minutes" >&2
-          exit 1
+          if ! accepted "$RUNNING" "$TARGET" "$BEFORE"; then
+            echo "Deployment did not converge to a CI-tested commit (running: ${RUNNING:-unreachable}, before: ${BEFORE:-unknown})" >&2
+            exit 1
+          fi
+          curl -sf "${PRODUCTION_URL}/healthz" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'
+          curl -sf "${PRODUCTION_URL}/readyz" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'
+          echo "Deployment healthy (tested commit + liveness + readiness)"
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
