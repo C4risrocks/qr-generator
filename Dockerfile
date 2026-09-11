@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 # Builder: install dependencies and the project with uv into a virtualenv
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim-trixie@sha256:dd29372629eeba2dd003fd9e9d35a5b8236c44727875a0364254b5127af88e65 AS builder
+FROM python:3.12-slim-trixie@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79 AS builder
 
 ENV UV_PYTHON_DOWNLOADS=0 \
     UV_LINK_MODE=copy \
@@ -46,7 +46,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ---------------------------------------------------------------------------
 # Runtime: slim image without uv, tests or dev tooling
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim-trixie@sha256:dd29372629eeba2dd003fd9e9d35a5b8236c44727875a0364254b5127af88e65 AS runtime
+FROM python:3.12-slim-trixie@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79 AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
