@@ -30,6 +30,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
       - name: Resolve target commit
         id: target
         run: |
@@ -39,19 +42,17 @@ jobs:
             SHA=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
               "https://api.github.com/repos/${{ github.repository }}/commits/main" | jq -r .sha)
             test -n "$SHA" && test "$SHA" != "null"
-            # Only a successful CI run from a real push to main of this very
-            # repository authorizes the deploy (not PR runs, not forks).
-            curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&branch=main&status=success&per_page=5" \
-              | jq -e --arg repo "${{ github.repository }}" \
-                '.workflow_runs | map(select(
-                  .conclusion == "success"
-                  and .event == "push"
-                  and .head_branch == "main"
-                  and .head_repository.full_name == $repo
-                )) | length > 0' > /dev/null
             echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only a successful CI run from a real push to main of this very
+      # repository authorizes the deploy (not PR runs, not forks).
+      - name: Require green CI for the target commit
+        uses: ./.github/actions/ci-green
+        with:
+          sha: ${{ steps.target.outputs.sha }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -100,23 +101,17 @@ jobs:
           # it must equal the freshly tested target, or differ from the
           # pre-deploy version while belonging to the CI-tested set. A stale
           # container can never satisfy this, and untested code neither.
-          hex_sha() {
+          sanitized_sha() {
+            # Validates/sanitizes: returns "" unless $1 is pure lowercase hex.
             case "$1" in ''|*[!0-9a-f]*) printf '';; *) printf '%s' "$1";; esac
           }
           tested() {
-            # Exact lookup for one commit instead of a bounded page of runs,
+            # Exact lookup for one commit via the shared CI-green script,
             # so a long deployment or many pushes cannot hide a valid SHA.
-            curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$1&event=push&branch=main&status=success&per_page=5" \
-              2>/dev/null | jq -e --arg repo "${{ github.repository }}" '[.workflow_runs[]
-                | select(.conclusion == "success"
-                  and .event == "push"
-                  and .head_branch == "main"
-                  and .head_repository.full_name == $repo)
-                ] | length > 0' > /dev/null
+            .github/scripts/ci-green.sh "$1" 2>/dev/null
           }
           TARGET="${{ steps.target.outputs.sha }}"
-          BEFORE="$(hex_sha "$(curl -sf "${PRODUCTION_URL}/version" 2>/dev/null | jq -r .git_sha 2>/dev/null || true)")"
+          BEFORE="$(sanitized_sha "$(curl -sf "${PRODUCTION_URL}/version" 2>/dev/null | jq -r .git_sha 2>/dev/null || true)")"
           accepted() {
             # $1=running $2=target $3=before. Accepts the freshly tested
             # target, or a different commit proven tested — never the stale
@@ -129,7 +124,7 @@ jobs:
           }
           RUNNING=""
           for _ in $(seq 1 120); do
-            RUNNING="$(hex_sha "$(curl -sf "${PRODUCTION_URL}/version" 2>/dev/null | jq -r .git_sha 2>/dev/null || true)")"
+            RUNNING="$(sanitized_sha "$(curl -sf "${PRODUCTION_URL}/version" 2>/dev/null | jq -r .git_sha 2>/dev/null || true)")"
             if accepted "$RUNNING" "$TARGET" "$BEFORE"; then
               echo "Running CI-tested commit $RUNNING"
               break

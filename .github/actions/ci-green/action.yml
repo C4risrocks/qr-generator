@@ -1,0 +1,18 @@
+name: Require green CI for a commit
+description: >
+  Fails unless a successful CI run from a real push to main of this very
+  repository exists for the given commit (not PR runs, not forks).
+
+inputs:
+  sha:
+    description: Commit SHA to verify.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Verify CI is green for this commit
+      shell: bash
+      env:
+        CI_GREEN_SHA: ${{ inputs.sha }}
+      run: "$GITHUB_WORKSPACE/.github/scripts/ci-green.sh" "$CI_GREEN_SHA"

@@ -23,9 +23,27 @@ def test_direct_ip_used_without_trusted_proxies(monkeypatch) -> None:
     assert client_ip(req) == "203.0.113.7"
 
 
-def test_trusted_proxy_uses_first_forwarded_ip(monkeypatch) -> None:
+def test_trusted_proxy_resolves_rightmost_untrusted_ip(monkeypatch) -> None:
+    """A single trusted proxy hop: the proxy appends the real client IP and
+    that rightmost entry is used."""
     monkeypatch.setenv("FORWARDED_ALLOW_IPS", "10.0.0.0/8, 172.18.0.2")
-    req = make_request("10.1.2.3", {"X-Forwarded-For": "198.51.100.9, 10.1.2.3"})
+    req = make_request("10.1.2.3", {"X-Forwarded-For": "198.51.100.9"})
+    assert client_ip(req) == "198.51.100.9"
+
+
+def test_inner_trusted_hops_are_skipped(monkeypatch) -> None:
+    """Two trusted proxies in front of the app (client -> A -> B -> app):
+    the rightmost untrusted entry is the client, not the inner proxy."""
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "10.0.0.0/8")
+    req = make_request(
+        "10.1.2.3", {"X-Forwarded-For": "198.51.100.9, 10.0.0.2"}
+    )
+    assert client_ip(req) == "198.51.100.9"
+
+
+def test_all_trusted_entries_fall_back_to_direct(monkeypatch) -> None:
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "10.0.0.0/8")
+    req = make_request("10.1.2.3", {"X-Forwarded-For": "10.9.9.9, 10.1.2.3"})
     assert client_ip(req) == "10.1.2.3"
 
 

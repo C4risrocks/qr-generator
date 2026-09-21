@@ -66,6 +66,76 @@ SESSION_SECRET = os.environ.get("SESSION_SECRET") or secrets.token_urlsafe(32)
 SESSION_HTTPS_ONLY = os.environ.get("SESSION_HTTPS_ONLY", "false").lower() == "true"
 
 
+def _header(scope, name: bytes) -> bytes | None:
+    for key, value in scope.get("headers", []):
+        if key == name:
+            return value
+    return None
+
+
+def _declared_length(scope) -> int | None:
+    """Content-Length as declared by the client, or None when absent/invalid."""
+    raw = _header(scope, b"content-length")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _is_multipart(scope) -> bool:
+    """Multipart bodies count double in the in-flight cap (see class docs)."""
+    raw = _header(scope, b"content-type")
+    return raw is not None and raw.split(b";", 1)[0].strip().lower() == b"multipart/form-data"
+
+
+async def _too_large(scope, receive, send) -> None:
+    """413 for a body beyond the per-request limit."""
+    response = JSONResponse({"detail": "request body too large"}, status_code=413)
+    await response(scope, receive, send)
+
+
+async def _apply_rate_limit(scope):
+    """Record the request and return a 429 response when over quota.
+
+    Returns None when the request may proceed (or when rate limiting is
+    unavailable, which fails open after warning).
+    """
+    if not (
+        scope["method"] == "POST"
+        and rate_limit.endpoint_for_path(scope["path"]) is not None
+    ):
+        return None
+    if not db.is_configured():
+        rate_limit.warn_once(
+            "no_db",
+            "DATABASE_URL is not configured; rate limiting disabled",
+        )
+        return None
+    try:
+        request = Request(scope)
+        ip = client_ip(request)
+        user_agent = request.headers.get("user-agent", "")
+        accept_language = request.headers.get("accept-language", "")
+        allowed, retry_after, client_id = await rate_limit.check_and_record(
+            ip, user_agent, accept_language, scope["path"]
+        )
+        if client_id is not None:
+            scope.setdefault("state", {})["client_id"] = client_id
+        if not allowed:
+            return JSONResponse(
+                {"detail": "rate limit exceeded; try again later"},
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+    except Exception:  # noqa: BLE001
+        rate_limit.warn_once(
+            "ratelimit", "rate limit check failed; allowing request"
+        )
+    return None
+
+
 class BodyLimitMiddleware:
     """Stream, cap and replay request bodies before application work.
 
@@ -96,33 +166,13 @@ class BodyLimitMiddleware:
             return
         limit = self.max_bytes if self.max_bytes is not None else MAX_BODY_BYTES
 
-        length: int | None = None
-        for name, value in scope.get("headers", []):
-            if name == b"content-length":
-                try:
-                    length = int(value)
-                except ValueError:
-                    length = None
-                break
+        length = _declared_length(scope)
         if length is not None and length > limit:
-            response = JSONResponse(
-                {"detail": "request body too large"},
-                status_code=413,
-            )
-            await response(scope, receive, send)
+            await _too_large(scope, receive, send)
             return
 
         reserved = 0
-        # Multipart parsers can spool file parts to disk themselves while
-        # the full body is still held in the external spool, so every
-        # multipart byte may occupy the tmpfs twice. Count multipart bytes
-        # twice in the in-flight cap so the real peak stays bounded. The
-        # media type is compared case-insensitively and without parameters.
-        multipart = any(
-            name == b"content-type"
-            and value.split(b";", 1)[0].strip().lower() == b"multipart/form-data"
-            for name, value in scope.get("headers", [])
-        )
+        multipart = _is_multipart(scope)
         try:
             with closing(
                 tempfile.SpooledTemporaryFile(max_size=64 * 1024, mode="w+b")
@@ -135,11 +185,7 @@ class BodyLimitMiddleware:
                     chunk = message.get("body", b"")
                     received += len(chunk)
                     if received > limit:
-                        response = JSONResponse(
-                            {"detail": "request body too large"},
-                            status_code=413,
-                        )
-                        await response(scope, receive, send)
+                        await _too_large(scope, receive, send)
                         return
                     cost = len(chunk) * (2 if multipart else 1)
                     if _inflight_body_bytes + cost > MAX_INFLIGHT_BODY_BYTES:
@@ -156,40 +202,10 @@ class BodyLimitMiddleware:
                     if not message.get("more_body"):
                         break
 
-                if (
-                    scope["method"] == "POST"
-                    and rate_limit.endpoint_for_path(scope["path"]) is not None
-                ):
-                    if db.is_configured():
-                        try:
-                            request = Request(scope)
-                            ip = client_ip(request)
-                            user_agent = request.headers.get("user-agent", "")
-                            accept_language = request.headers.get("accept-language", "")
-                            allowed, retry_after, client_id = (
-                                await rate_limit.check_and_record(
-                                    ip, user_agent, accept_language, scope["path"]
-                                )
-                            )
-                            if client_id is not None:
-                                scope.setdefault("state", {})["client_id"] = client_id
-                            if not allowed:
-                                response = JSONResponse(
-                                    {"detail": "rate limit exceeded; try again later"},
-                                    status_code=429,
-                                    headers={"Retry-After": str(retry_after)},
-                                )
-                                await response(scope, receive, send)
-                                return
-                        except Exception:  # noqa: BLE001
-                            rate_limit.warn_once(
-                                "ratelimit", "rate limit check failed; allowing request"
-                            )
-                    else:
-                        rate_limit.warn_once(
-                            "no_db",
-                            "DATABASE_URL is not configured; rate limiting disabled",
-                        )
+                rejection = await _apply_rate_limit(scope)
+                if rejection is not None:
+                    await rejection(scope, receive, send)
+                    return
 
                 body.seek(0)
 

@@ -308,7 +308,10 @@ Recomendada cuando se necesiten releases versionadas o rollback exacto.
 
 - En SVG los estilos `rounded`, `vertical-bars` y `horizontal-bars` caen a
   cuadrados simples, y los gradientes a color sólido (con aviso).
-- El logo, el fondo transparente, el marco y el texto solo se admiten en PNG.
+- El logo, el fondo transparente, el marco y el texto solo se admiten en
+  PNG. En `/api/generate` y `/api/previews`, una petición SVG que los incluya
+  no se rechaza: esas opciones se omiten y se avisa por `X-QR-Warnings`
+  (la web además avisa antes de exportar).
 - El contenido de los inputs se guarda en `qr_inputs` con hash SHA-256 y se
   elimina según `INPUT_RETENTION_DAYS`.
 - SQLite (solo desarrollo/tests) replica el esquema de PostgreSQL; las

@@ -37,10 +37,12 @@ def client_ip(request: Request) -> str:
     """Best-effort client IP address.
 
     ``X-Forwarded-For`` is only honored when the direct peer is a configured
-    trusted proxy, and entries are then read right-to-left: a trusted proxy
-    appends the address it actually sees, so any attacker-controlled entries
-    sit to the left of it. The rightmost valid IP is therefore the only one
-    that cannot be spoofed.
+    trusted proxy. Entries are then read right-to-left, skipping valid
+    addresses that belong to trusted proxy networks: a trusted proxy appends
+    the address it actually sees, so inner trusted hops and any
+    attacker-controlled entries sit to the left of it, and the rightmost
+    untrusted entry is the only one that cannot be spoofed. When every
+    entry is trusted (or invalid), the direct peer address is used.
     """
     direct = request.client.host if request.client else "unknown"
     forwarded_for = request.headers.get("x-forwarded-for", "")
@@ -50,12 +52,16 @@ def client_ip(request: Request) -> str:
         peer = ipaddress.ip_address(direct)
     except ValueError:
         return direct
-    if not any(peer in net for net in trusted_proxy_networks()):
+    networks = trusted_proxy_networks()
+    if not any(peer in net for net in networks):
         return direct
     for candidate in reversed(forwarded_for.split(",")):
+        candidate = candidate.strip()
         try:
-            ipaddress.ip_address(candidate.strip())
+            ip = ipaddress.ip_address(candidate)
         except ValueError:
             continue
-        return candidate.strip()
+        if any(ip in net for net in networks):
+            continue  # inner trusted proxy hop; keep walking left
+        return candidate
     return direct

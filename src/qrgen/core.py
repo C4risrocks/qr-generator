@@ -83,6 +83,9 @@ STYLE_INFO: tuple[StyleInfo, ...] = (
 STYLES = tuple(info.id for info in STYLE_INFO)
 STYLE_LABELS = {info.id: info.label for info in STYLE_INFO}
 SVG_CAPABLE_STYLES = frozenset(info.id for info in STYLE_INFO if info.svg)
+# Single source of truth for the SVG fallbacks, shared by previews and export.
+SVG_STYLE_FALLBACK_WARNING = "is not available in SVG; using plain squares"
+SVG_GRADIENT_FALLBACK_WARNING = "gradients are not available in SVG; using solid foreground"
 
 
 def _preview_style(style: str, svg_mode: bool) -> str:
@@ -336,15 +339,6 @@ def _parse_config(
     if not 0 < config.logo_ratio <= MAX_LOGO_RATIO:
         raise InvalidInput(f"logo_ratio must be between 0 and {MAX_LOGO_RATIO}")
 
-    if config.logo is not None and config.image_format == SVG:
-        raise InvalidInput("logo embedding is only supported for PNG output")
-    if config.transparent_background and config.image_format == SVG:
-        raise InvalidInput("transparent background is only supported for PNG output")
-    if (
-        config.image_format == SVG
-        and (config.frame_color is not None or config.title or config.subtitle)
-    ):
-        raise InvalidInput("frame and text are only supported for PNG output")
     if config.transparent_background and (
         config.frame_color is not None or config.title or config.subtitle
     ):
@@ -368,6 +362,35 @@ def _parse_config(
         )
 
     return foreground, background, gradient_to, warnings
+
+
+def omit_png_only_options(config: QRConfig) -> tuple[QRConfig, tuple[str, ...]]:
+    """SVG output cannot carry a logo, transparency, frame or text; return a
+    config with those options reset (omitted, not rejected) plus one warning
+    per dropped option, so every client gets the same lenient treatment the
+    web UI applies before exporting."""
+    if config.image_format != SVG:
+        return config, ()
+    dropped: list[str] = []
+    if config.logo is not None:
+        dropped.append("logo is not available in SVG; omitted")
+    if config.transparent_background:
+        dropped.append("transparent background is not available in SVG; using solid background")
+    if config.frame_color is not None:
+        dropped.append("frame is not available in SVG; omitted")
+    if config.title.strip():
+        dropped.append("title is not available in SVG; omitted")
+    if config.subtitle.strip():
+        dropped.append("subtitle is not available in SVG; omitted")
+    coerced = replace(
+        config,
+        logo=None,
+        transparent_background=False,
+        frame_color=None,
+        title="",
+        subtitle="",
+    )
+    return coerced, tuple(dropped)
 
 
 def _build_matrix(config: QRConfig, error_correction: int) -> QRCode:
@@ -429,12 +452,12 @@ def _render_svg(
     bg: tuple[int, int, int],
     warnings: list[str],
 ) -> bytes:
-    if config.style in {STYLE_ROUNDED, STYLE_VERTICAL_BARS, STYLE_HORIZONTAL_BARS}:
+    if config.style not in SVG_CAPABLE_STYLES:
         warnings.append(
-            f"style {STYLE_LABELS[config.style]} is not available in SVG; using plain squares"
+            f"style {STYLE_LABELS[config.style]} {SVG_STYLE_FALLBACK_WARNING}"
         )
     if config.gradient != GRADIENT_NONE:
-        warnings.append("gradients are not available in SVG; using solid foreground")
+        warnings.append(SVG_GRADIENT_FALLBACK_WARNING)
     img = qr.make_image(
         image_factory=SvgPathImage,
         module_drawer=build_svg_drawer(config.style),
@@ -514,7 +537,9 @@ def generate_qr(config: QRConfig) -> QRResult:
 
     Raises InvalidInput for anything that cannot be generated.
     """
+    config, omitted = omit_png_only_options(config)
     fg, bg, gt, warnings = _parse_config(config)
+    warnings.extend(omitted)
     error_correction = _resolve_error_correction(config, warnings)
     qr = _build_matrix(config, error_correction)
 
@@ -543,17 +568,19 @@ def generate_previews(config: QRConfig) -> tuple[list[Preview], Preview, tuple[s
     the selected preview applies the real style, frame, title, subtitle, border
     and a capped box size so it matches the final download visually.
 
-    When SVG output is requested, thumbnails use the same fallbacks as the
-    real SVG export (plain squares for unsupported styles, solid foreground
-    for gradients) and report the same warnings, so the preview never shows
-    something the download cannot produce.
+    When SVG output is requested, PNG-only options (logo, transparency,
+    frame and text) are omitted exactly like the real SVG export, thumbnails
+    use the same fallbacks (plain squares for unsupported styles, solid
+    foreground for gradients) and the warnings match, so the preview never
+    shows something the download cannot produce.
     """
+    config, omitted = omit_png_only_options(config)
     if config.style not in STYLES:
         raise InvalidInput(
             f"unknown style {config.style!r}; choose from: {', '.join(STYLES)}"
         )
-    # Validate the requested configuration as-is (SVG/PNG-only rules, sizes),
-    # so previews and downloads accept and reject the same inputs.
+    # Validate the coerced configuration (sizes, colors), so previews and
+    # downloads accept and reject the same inputs.
     _parse_config(config)
     svg_mode = config.image_format == SVG
     base = replace(
@@ -568,13 +595,14 @@ def generate_previews(config: QRConfig) -> tuple[list[Preview], Preview, tuple[s
     )
     fg, bg, gt, warnings = _parse_config(base)
     warnings = list(warnings)
+    warnings.extend(omitted)
     if svg_mode:
         if config.style not in SVG_CAPABLE_STYLES:
             warnings.append(
-                f"style {STYLE_LABELS[config.style]} is not available in SVG; using plain squares"
+                f"style {STYLE_LABELS[config.style]} {SVG_STYLE_FALLBACK_WARNING}"
             )
         if config.gradient != GRADIENT_NONE:
-            warnings.append("gradients are not available in SVG; using solid foreground")
+            warnings.append(SVG_GRADIENT_FALLBACK_WARNING)
             gt = fg
     error_correction = _resolve_error_correction(base, warnings)
     qr = _build_matrix(base, error_correction)

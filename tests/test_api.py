@@ -147,7 +147,7 @@ async def test_concurrent_multipart_obeys_inflight_cap(monkeypatch) -> None:
     request that would exceed it and releases the budget afterwards."""
     import asyncio
 
-    import httpx2 as httpx
+    import httpx2
 
     from qrgen import server
 
@@ -171,10 +171,10 @@ async def test_concurrent_multipart_obeys_inflight_cap(monkeypatch) -> None:
             yield b"x"
         yield b"\r\n--BOUND--\r\n"
 
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as http2:
         async def post():
-            return await http.post(
+            return await http2.post(
                 "/api/generate",
                 content=body(),
                 headers={"Content-Type": "multipart/form-data; boundary=BOUND"},
@@ -189,7 +189,7 @@ async def test_concurrent_multipart_obeys_inflight_cap(monkeypatch) -> None:
         assert 503 in {res1.status_code, res2.status_code}
         assert server._inflight_body_bytes == 0
 
-        ok = await http.post("/api/generate", data={"data": "hola"})
+        ok = await http2.post("/api/generate", data={"data": "hola"})
         assert ok.status_code == 200
         assert server._inflight_body_bytes == 0
 
@@ -421,15 +421,43 @@ def test_previews_svg_reports_fallback_warnings() -> None:
     assert any("gradients are not available in SVG" in w for w in payload["warnings"])
 
 
-def test_previews_svg_rejects_png_only_options() -> None:
-    """Previews and downloads must accept/reject the same inputs."""
+def test_previews_svg_omits_png_only_options() -> None:
+    """SVG previews and downloads must treat PNG-only options the same way:
+    the server omits them (with a warning) instead of rejecting the request."""
     big_logo = Image.new("RGB", (64, 64), (0, 255, 0))
     res = client.post(
         "/api/previews",
         data={"data": "https://example.com", "image_format": "svg"},
         files={"logo": ("logo.png", png_bytes(big_logo), "image/png")},
     )
-    assert res.status_code == 400
+    assert res.status_code == 200
+    assert any("logo is not available in SVG" in w for w in res.json()["warnings"])
+
+
+def test_generate_svg_omits_png_only_options() -> None:
+    """A non-UI API client sending PNG-only options with SVG gets an SVG
+    export with the options omitted, not a 400."""
+    big_logo = Image.new("RGB", (64, 64), (0, 255, 0))
+    res = client.post(
+        "/api/generate",
+        data={
+            "data": "https://example.com",
+            "image_format": "svg",
+            "transparent_background": "true",
+            "frame_color": "#18181b",
+            "title": "Mi enlace",
+            "subtitle": "Sitio web",
+        },
+        files={"logo": ("logo.png", png_bytes(big_logo), "image/png")},
+    )
+    assert res.status_code == 200
+    assert "svg" in res.headers["content-type"]
+    warnings = res.headers.get("x-qr-warnings", "")
+    assert "logo is not available in SVG" in warnings
+    assert "transparent background is not available in SVG" in warnings
+    assert "frame is not available in SVG" in warnings
+    assert "title is not available in SVG" in warnings
+    assert "subtitle is not available in SVG" in warnings
 
 
 WEB_PAYLOAD = {

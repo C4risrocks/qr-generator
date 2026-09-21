@@ -116,14 +116,20 @@ def test_transparent_background_renders_rgba() -> None:
     assert corner[3] == 0
 
 
-def test_transparent_background_rejected_for_svg() -> None:
-    with pytest.raises(InvalidInput, match="transparent background is only supported for PNG"):
-        generate_qr(make_config(image_format=SVG, transparent_background=True))
+def test_transparent_background_omitted_for_svg() -> None:
+    result = generate_qr(make_config(image_format=SVG, transparent_background=True))
+    assert any(
+        "transparent background is not available in SVG" in w for w in result.warnings
+    )
 
 
-def test_frame_and_title_rejected_for_svg() -> None:
-    with pytest.raises(InvalidInput, match="frame and text are only supported for PNG"):
-        generate_qr(make_config(image_format=SVG, title="Hola"))
+def test_frame_and_title_omitted_for_svg() -> None:
+    result = generate_qr(
+        make_config(image_format=SVG, frame_color="#18181b", title="Hola", subtitle="Web")
+    )
+    assert any("frame is not available in SVG" in w for w in result.warnings)
+    assert any("title is not available in SVG" in w for w in result.warnings)
+    assert any("subtitle is not available in SVG" in w for w in result.warnings)
 
 
 def test_frame_and_title_require_solid_background() -> None:
@@ -149,10 +155,11 @@ def test_logo_embeds_and_forces_error_correction() -> None:
     assert center[:3] == (0, 255, 0)
 
 
-def test_logo_rejected_for_svg() -> None:
+def test_logo_omitted_for_svg() -> None:
     logo = Image.new("RGB", (64, 64), (0, 255, 0))
-    with pytest.raises(InvalidInput, match="only supported for PNG"):
-        generate_qr(make_config(image_format=SVG, logo=logo))
+    result = generate_qr(make_config(image_format=SVG, logo=logo))
+    assert any("logo is not available in SVG" in w for w in result.warnings)
+    assert result.content.lstrip().startswith(b"<")
 
 
 def test_empty_data_rejected() -> None:
