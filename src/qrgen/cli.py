@@ -19,8 +19,8 @@ from qrgen.core import (
     STYLE_INFO,
     STYLES,
     InvalidInput,
-    QRConfig,
     generate_qr,
+    parse_options,
     validate_logo,
 )
 from qrgen.inputs import parse_file, parse_text
@@ -137,23 +137,27 @@ def run_generate(argv: list[str]) -> int:
             print(f"error: cannot read logo image {args.logo!r}: {exc}", file=sys.stderr)
             return 2
 
-    config = QRConfig(
+    # The CLI adapter: argparse dests mapped to the canonical QRConfig
+    # field names so both adapters share one option contract.
+    config = parse_options(
+        {
+            "style": args.style,
+            "foreground": args.fg,
+            "background": args.bg,
+            "gradient": args.gradient,
+            "gradient_to": args.gradient_to or args.fg,
+            "error_correction": args.error_correction,
+            "box_size": args.box_size,
+            "border": args.border,
+            "image_format": image_format,
+            "logo_ratio": args.logo_ratio,
+            "transparent_background": args.transparent_background,
+            "frame_color": args.frame,
+            "title": args.title,
+            "subtitle": args.subtitle,
+        },
         data=payload.content,
-        style=args.style,
-        foreground=args.fg,
-        background=args.bg,
-        gradient=args.gradient,
-        gradient_to=args.gradient_to or args.fg,
-        error_correction=args.error_correction,
-        box_size=args.box_size,
-        border=args.border,
-        image_format=image_format,
         logo=logo,
-        logo_ratio=args.logo_ratio,
-        transparent_background=args.transparent_background,
-        frame_color=args.frame,
-        title=args.title,
-        subtitle=args.subtitle,
     )
 
     try:

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import io
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from dataclasses import fields as dataclass_fields
 from decimal import Decimal
+from typing import Any, get_args, get_type_hints
 
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 from qrcode import QRCode, constants
@@ -256,6 +259,73 @@ class QRConfig:
     frame_color: str | None = None
     title: str = ""
     subtitle: str = ""
+
+
+# The dataclass declaration IS the option contract: parse_options derives
+# coercion from these type hints. data and logo are transport, not options.
+_TRANSPORT_FIELDS = frozenset({"data", "logo"})
+_TYPE_HINTS = get_type_hints(QRConfig)
+_TRUE_STRINGS = frozenset({"true", "1", "yes", "on"})
+_FALSE_STRINGS = frozenset({"false", "0", "no", "off", ""})
+
+
+def _coerce_option(name: str, raw: Any, expected: Any) -> Any:
+    """Coerce one raw value (form strings, argparse values) to the declared
+    field type, with user-visible error messages."""
+    if expected is bool:
+        if isinstance(raw, bool):
+            return raw
+        text = str(raw).strip().lower()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+        raise InvalidInput(f"{name} must be a boolean")
+    if expected is int:
+        if isinstance(raw, int) and not isinstance(raw, bool):
+            return raw
+        try:
+            return int(str(raw).strip())
+        except ValueError as exc:
+            raise InvalidInput(f"{name} must be an integer") from exc
+    if expected is float:
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return float(raw)
+        try:
+            return float(str(raw).strip())
+        except ValueError as exc:
+            raise InvalidInput(f"{name} must be a number") from exc
+    if raw is None:
+        if type(None) in get_args(expected):
+            return None
+        raise InvalidInput(f"{name} must not be empty")
+    text = raw if isinstance(raw, str) else str(raw)
+    if type(None) in get_args(expected) and text == "":
+        return None
+    return text
+
+
+def parse_options(source: Mapping[str, Any], /, **overrides: Any) -> QRConfig:
+    """Build a QRConfig from any name→value mapping (web form, CLI args).
+
+    The single authority for the QR request contract: the dataclass
+    declaration above is the option list. Unknown keys are ignored (future
+    clients), missing keys take the dataclass default, and values are
+    coerced per the declared types. Transport fields (``data``, ``logo``)
+    arrive as keyword overrides. Raises InvalidInput with user-visible
+    messages.
+    """
+    values = {
+        field.name: _coerce_option(
+            field.name, source.get(field.name), _TYPE_HINTS[field.name]
+        )
+        for field in dataclass_fields(QRConfig)
+        if field.name not in _TRANSPORT_FIELDS and field.name in source
+    }
+    try:
+        return QRConfig(**{**values, **overrides})
+    except TypeError as exc:
+        raise InvalidInput(str(exc)) from exc
 
 
 @dataclass(frozen=True)

@@ -8,15 +8,14 @@ import io
 import logging
 import os
 import secrets
-import tempfile
-from contextlib import asynccontextmanager, closing
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import (
     BackgroundTasks,
+    Depends,
     FastAPI,
-    File,
-    Form,
     HTTPException,
     Request,
     UploadFile,
@@ -25,23 +24,24 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image
 from sqlalchemy import text
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.middleware.sessions import SessionMiddleware
 
 from qrgen import db, inputs, rate_limit
 from qrgen.admin import router as admin_router
+from qrgen.body_gate import DEFAULT_INFLIGHT_BUDGET, MAX_BODY_BYTES, BodyGate
 from qrgen.core import (
-    DEFAULT_EC,
     FORMATS,
     GRADIENT_INFO,
     MEDIA_TYPES,
     PALETTES,
-    PNG,
     PRESETS,
     STYLE_INFO,
     InvalidInput,
     QRConfig,
     generate_previews,
     generate_qr,
+    parse_options,
     validate_logo,
 )
 from qrgen.inputs import InputPayload
@@ -51,49 +51,9 @@ from qrgen.webassets import WEB_DIR
 logger = logging.getLogger("qrgen.server")
 
 MAX_LOGO_BYTES = 5 * 1024 * 1024
-MAX_BODY_BYTES = 6 * 1024 * 1024
-# Global cap on bytes held in request spools at any moment (avoids filling
-# the tmpfs with concurrent 6 MB uploads). The counter is per process and
-# the server deliberately runs a single worker, so the cap matches the
-# per-container tmpfs budget; scale out with container replicas instead of
-# extra workers. Excess requests get 503.
-MAX_INFLIGHT_BODY_BYTES = int(
-    os.environ.get("MAX_INFLIGHT_BODY_BYTES", str(32 * 1024 * 1024))
-)
-_inflight_body_bytes = 0
 
 SESSION_SECRET = os.environ.get("SESSION_SECRET") or secrets.token_urlsafe(32)
 SESSION_HTTPS_ONLY = os.environ.get("SESSION_HTTPS_ONLY", "false").lower() == "true"
-
-
-def _header(scope, name: bytes) -> bytes | None:
-    for key, value in scope.get("headers", []):
-        if key == name:
-            return value
-    return None
-
-
-def _declared_length(scope) -> int | None:
-    """Content-Length as declared by the client, or None when absent/invalid."""
-    raw = _header(scope, b"content-length")
-    if raw is None:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
-
-
-def _is_multipart(scope) -> bool:
-    """Multipart bodies count double in the in-flight cap (see class docs)."""
-    raw = _header(scope, b"content-type")
-    return raw is not None and raw.split(b";", 1)[0].strip().lower() == b"multipart/form-data"
-
-
-async def _too_large(scope, receive, send) -> None:
-    """413 for a body beyond the per-request limit."""
-    response = JSONResponse({"detail": "request body too large"}, status_code=413)
-    await response(scope, receive, send)
 
 
 async def _apply_rate_limit(scope):
@@ -136,92 +96,26 @@ async def _apply_rate_limit(scope):
     return None
 
 
-class BodyLimitMiddleware:
-    """Stream, cap and replay request bodies before application work.
+class RateLimitMiddleware:
+    """Records the daily quota before the app runs.
 
-    Bodies are spooled to memory only up to a small threshold and then to
-    the temporary filesystem. This lets the middleware reject oversized
-    chunked requests before they consume rate-limit quota, without keeping
-    the full body in RAM. The completed body is replayed to FastAPI after
-    the size and rate-limit checks pass.
-
-    A process-wide in-flight cap (``MAX_INFLIGHT_BODY_BYTES``) bounds how
-    many spooled bytes may exist at once across requests; beyond it the
-    server answers 503 with ``Retry-After`` instead of exhausting the
-    tmpfs. The server runs a single worker per container so the cap
-    matches the per-container tmpfs budget; scale out with container
-    replicas instead of extra workers. Multipart bodies count double,
-    because the form parser may spool file parts to the tmpfs
-    independently of this spool.
+    Sits inside the BodyGate: the gate only calls through once the body is
+    complete and bounded, so the quota is consumed after size checks and an
+    oversized body never reaches the counter.
     """
 
-    def __init__(self, app, max_bytes: int | None = None) -> None:
+    def __init__(self, app) -> None:
         self.app = app
-        self.max_bytes = max_bytes
 
     async def __call__(self, scope, receive, send):
-        global _inflight_body_bytes
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        limit = self.max_bytes if self.max_bytes is not None else MAX_BODY_BYTES
-
-        length = _declared_length(scope)
-        if length is not None and length > limit:
-            await _too_large(scope, receive, send)
+        rejection = await _apply_rate_limit(scope)
+        if rejection is not None:
+            await rejection(scope, receive, send)
             return
-
-        reserved = 0
-        multipart = _is_multipart(scope)
-        try:
-            with closing(
-                tempfile.SpooledTemporaryFile(max_size=64 * 1024, mode="w+b")
-            ) as body:
-                received = 0
-                while True:
-                    message = await receive()
-                    if message["type"] != "http.request":
-                        return
-                    chunk = message.get("body", b"")
-                    received += len(chunk)
-                    if received > limit:
-                        await _too_large(scope, receive, send)
-                        return
-                    cost = len(chunk) * (2 if multipart else 1)
-                    if _inflight_body_bytes + cost > MAX_INFLIGHT_BODY_BYTES:
-                        response = JSONResponse(
-                            {"detail": "server busy; try again later"},
-                            status_code=503,
-                            headers={"Retry-After": "5"},
-                        )
-                        await response(scope, receive, send)
-                        return
-                    _inflight_body_bytes += cost
-                    reserved += cost
-                    body.write(chunk)
-                    if not message.get("more_body"):
-                        break
-
-                rejection = await _apply_rate_limit(scope)
-                if rejection is not None:
-                    await rejection(scope, receive, send)
-                    return
-
-                body.seek(0)
-
-                async def replay():
-                    chunk = body.read(64 * 1024)
-                    if chunk:
-                        return {
-                            "type": "http.request",
-                            "body": chunk,
-                            "more_body": True,
-                        }
-                    return {"type": "http.request", "body": b"", "more_body": False}
-
-                await self.app(scope, replay, send)
-        finally:
-            _inflight_body_bytes -= reserved
+        await self.app(scope, receive, send)
 
 
 @asynccontextmanager
@@ -239,26 +133,18 @@ async def lifespan(app: FastAPI):
     await db.dispose()
 
 
-app = FastAPI(
-    title="QR Generator",
-    description="Personalizable QR codes from a link or text.",
-    lifespan=lifespan,
-)
+@dataclass(frozen=True)
+class FormRequest:
+    """Everything the QR endpoints need, resolved once per request."""
+
+    config: QRConfig
+    payload: InputPayload
+    client_id: int | None
 
 
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=SESSION_SECRET,
-    same_site="lax",
-    https_only=SESSION_HTTPS_ONLY,
-    max_age=60 * 60 * 8,
-)
-
-# Outermost: size is checked and the rate-limit counter is recorded only after
-# the complete, bounded body has been received.
-app.add_middleware(BodyLimitMiddleware)
-
-
+# Module level on purpose: FastAPI evaluates annotations against module
+# globals, so the dependency and its result type cannot live inside
+# build_app's closure when __future__ annotations are on.
 async def _read_logo(logo: UploadFile | None) -> Image.Image | None:
     if logo is None:
         return None
@@ -298,215 +184,183 @@ async def _resolve_input(data: str, file: UploadFile | None) -> InputPayload:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def _build_config(
-    data: str,
-    style: str,
-    foreground: str,
-    background: str,
-    gradient: str,
-    gradient_to: str,
-    error_correction: str,
-    box_size: int,
-    border: int,
-    image_format: str,
-    logo: Image.Image | None,
-    logo_ratio: float,
-    transparent_background: bool,
-    frame_color: str | None,
-    title: str,
-    subtitle: str,
-) -> QRConfig:
+async def form_request(request: Request) -> FormRequest:
+    """The QR options seam: one dependency that turns any request body
+    (web form today, other mappings tomorrow) into a validated QRConfig.
+
+    Data/file resolution and logo decoding hide here; the declared
+    QRConfig fields are the option contract via parse_options.
+    """
+    form = await request.form()
+    file = form.get("file")
+    logo = form.get("logo")
+    payload = await _resolve_input(
+        str(form.get("data", "")),
+        file if isinstance(file, StarletteUploadFile) else None,
+    )
+    logo_image = await _read_logo(logo if isinstance(logo, StarletteUploadFile) else None)
     try:
-        return QRConfig(
-            data=data,
-            style=style,
-            foreground=foreground,
-            background=background,
-            gradient=gradient,
-            gradient_to=gradient_to,
-            error_correction=error_correction,
-            box_size=box_size,
-            border=border,
-            image_format=image_format,
-            logo=logo,
-            logo_ratio=logo_ratio,
-            transparent_background=transparent_background,
-            frame_color=frame_color or None,
-            title=title,
-            subtitle=subtitle,
+        config = parse_options(form, data=payload.content, logo=logo_image)
+    except InvalidInput as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FormRequest(
+        config=config,
+        payload=payload,
+        client_id=getattr(request.state, "client_id", None),
+    )
+
+
+def build_app(
+    *,
+    max_body_bytes: int = MAX_BODY_BYTES,
+    inflight_max_bytes: int = DEFAULT_INFLIGHT_BUDGET,
+) -> FastAPI:
+    """Construct the application.
+
+    Body limits are constructor parameters: production wiring keeps the
+    env-derived defaults, and tests construct apps with explicit limits
+    instead of patching module state.
+    """
+    application = FastAPI(
+        title="QR Generator",
+        description="Personalizable QR codes from a link or text.",
+        lifespan=lifespan,
+    )
+
+    application.add_middleware(
+        SessionMiddleware,
+        secret_key=SESSION_SECRET,
+        same_site="lax",
+        https_only=SESSION_HTTPS_ONLY,
+        max_age=60 * 60 * 8,
+    )
+    # add_middleware wraps the existing stack, so the last one added is the
+    # outermost. The body gate must run first: it streams and bounds the
+    # body, then hands a complete body to the rate limiter, so size
+    # rejections never consume quota.
+    application.add_middleware(RateLimitMiddleware)
+    application.add_middleware(
+        BodyGate, max_bytes=max_body_bytes, inflight_budget=inflight_max_bytes
+    )
+
+    @application.get("/")
+    def index() -> FileResponse:
+        return FileResponse(WEB_DIR / "index.html")
+
+    @application.get("/healthz")
+    def healthz() -> JSONResponse:
+        """Lightweight liveness probe; no QR work, no external dependencies."""
+        return JSONResponse({"status": "ok"})
+
+    def _app_version() -> str:
+        try:
+            from importlib.metadata import version
+
+            return version("qrgen")
+        except Exception:  # noqa: BLE001
+            return "unknown"
+
+    @application.get("/version")
+    def version() -> JSONResponse:
+        """Build identity: lets the deploy workflow verify the running commit."""
+        return JSONResponse(
+            {
+                "version": _app_version(),
+                "git_sha": os.environ.get("QRGEN_GIT_SHA", "unknown"),
+                "build_date": os.environ.get("QRGEN_BUILD_DATE", "unknown"),
+            }
         )
-    except TypeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @application.get("/readyz")
+    async def readyz() -> JSONResponse:
+        """Readiness probe: checks the database connection."""
+        if not db.is_configured():
+            return JSONResponse({"status": "db not configured"}, status_code=503)
+        try:
+            async with db.session_factory()() as session:
+                await session.execute(text("SELECT 1"))
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"status": "db unavailable"}, status_code=503)
+        return JSONResponse({"status": "ok"})
 
-@app.get("/")
-def index() -> FileResponse:
-    return FileResponse(WEB_DIR / "index.html")
+    @application.get("/api/catalog")
+    def catalog() -> JSONResponse:
+        return JSONResponse(
+            {
+                "styles": [
+                    {
+                        "id": info.id,
+                        "label": info.label,
+                        "description": info.description,
+                        "png": info.png,
+                        "svg": info.svg,
+                    }
+                    for info in STYLE_INFO
+                ],
+                "gradient_types": GRADIENT_INFO,
+                "ec_levels": [
+                    {"id": level, "label": f"{level} · {pct}%"}
+                    for level, pct in (("L", 7), ("M", 15), ("Q", 25), ("H", 30))
+                ],
+                "formats": list(FORMATS),
+                "palettes": list(PALETTES),
+                "presets": list(PRESETS),
+            }
+        )
 
-
-@app.get("/healthz")
-def healthz() -> JSONResponse:
-    """Lightweight liveness probe; no QR work, no external dependencies."""
-    return JSONResponse({"status": "ok"})
-
-
-def _app_version() -> str:
-    try:
-        from importlib.metadata import version
-
-        return version("qrgen")
-    except Exception:  # noqa: BLE001
-        return "unknown"
-
-
-@app.get("/version")
-def version() -> JSONResponse:
-    """Build identity: lets the deploy workflow verify the running commit."""
-    return JSONResponse(
-        {
-            "version": _app_version(),
-            "git_sha": os.environ.get("QRGEN_GIT_SHA", "unknown"),
-            "build_date": os.environ.get("QRGEN_BUILD_DATE", "unknown"),
-        }
-    )
-
-
-@app.get("/readyz")
-async def readyz() -> JSONResponse:
-    """Readiness probe: checks the database connection."""
-    if not db.is_configured():
-        return JSONResponse({"status": "db not configured"}, status_code=503)
-    try:
-        async with db.session_factory()() as session:
-            await session.execute(text("SELECT 1"))
-    except Exception:  # noqa: BLE001
-        return JSONResponse({"status": "db unavailable"}, status_code=503)
-    return JSONResponse({"status": "ok"})
-
-
-@app.get("/api/catalog")
-def catalog() -> JSONResponse:
-    return JSONResponse(
-        {
-            "styles": [
-                {
-                    "id": info.id,
-                    "label": info.label,
-                    "description": info.description,
-                    "png": info.png,
-                    "svg": info.svg,
-                }
-                for info in STYLE_INFO
-            ],
-            "gradient_types": GRADIENT_INFO,
-            "ec_levels": [
-                {"id": level, "label": f"{level} · {pct}%"}
-                for level, pct in (("L", 7), ("M", 15), ("Q", 25), ("H", 30))
-            ],
-            "formats": list(FORMATS),
-            "palettes": list(PALETTES),
-            "presets": list(PRESETS),
-        }
-    )
-
-
-@app.post("/api/previews")
-async def previews(
-    data: Annotated[str, Form()] = "",
-    file: Annotated[UploadFile | None, File()] = None,
-    style: Annotated[str, Form()] = "square",
-    foreground: Annotated[str, Form()] = "#000000",
-    background: Annotated[str, Form()] = "#ffffff",
-    gradient: Annotated[str, Form()] = "none",
-    gradient_to: Annotated[str, Form()] = "#000000",
-    error_correction: Annotated[str, Form()] = DEFAULT_EC,
-    box_size: Annotated[int, Form()] = 10,
-    border: Annotated[int, Form()] = 4,
-    image_format: Annotated[str, Form()] = PNG,
-    logo: Annotated[UploadFile | None, File()] = None,
-    logo_ratio: Annotated[float, Form()] = 0.2,
-    transparent_background: Annotated[bool, Form()] = False,
-    frame_color: Annotated[str | None, Form()] = None,
-    title: Annotated[str, Form()] = "",
-    subtitle: Annotated[str, Form()] = "",
-) -> JSONResponse:
-    payload = await _resolve_input(data, file)
-    logo_image = await _read_logo(logo)
-    config = _build_config(
-        payload.content, style, foreground, background, gradient, gradient_to,
-        error_correction, box_size, border, image_format, logo_image,
-        logo_ratio, transparent_background, frame_color, title, subtitle,
-    )
-    try:
-        previews_out, selected, warnings = await run_in_threadpool(generate_previews, config)
-    except InvalidInput as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return JSONResponse(
-        {
-            "styles": [
-                {
-                    "id": preview.style,
+    @application.post("/api/previews")
+    async def previews(
+        qr: Annotated[FormRequest, Depends(form_request)],
+    ) -> JSONResponse:
+        try:
+            previews_out, selected, warnings = await run_in_threadpool(
+                generate_previews, qr.config
+            )
+        except InvalidInput as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(
+            {
+                "styles": [
+                    {
+                        "id": preview.style,
+                        "image": "data:image/png;base64,"
+                        + base64.b64encode(preview.content).decode("ascii"),
+                    }
+                    for preview in previews_out
+                ],
+                "selected": {
+                    "style": selected.style,
                     "image": "data:image/png;base64,"
-                    + base64.b64encode(preview.content).decode("ascii"),
-                }
-                for preview in previews_out
-            ],
-            "selected": {
-                "style": selected.style,
-                "image": "data:image/png;base64,"
-                + base64.b64encode(selected.content).decode("ascii"),
-            },
-            "warnings": list(warnings),
-        }
-    )
+                    + base64.b64encode(selected.content).decode("ascii"),
+                },
+                "warnings": list(warnings),
+            }
+        )
+
+    @application.post("/api/generate")
+    async def generate(
+        background_tasks: BackgroundTasks,
+        qr: Annotated[FormRequest, Depends(form_request)],
+    ) -> Response:
+        try:
+            result = await run_in_threadpool(generate_qr, qr.config)
+        except InvalidInput as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        background_tasks.add_task(inputs.persist_input, qr.client_id, qr.payload)
+
+        headers = {"X-QR-Warnings": "; ".join(result.warnings)}
+        return Response(
+            content=result.content,
+            media_type=MEDIA_TYPES[result.image_format],
+            headers=headers,
+        )
+
+    application.include_router(admin_router)
+    return application
 
 
-@app.post("/api/generate")
-async def generate(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    data: Annotated[str, Form()] = "",
-    file: Annotated[UploadFile | None, File()] = None,
-    style: Annotated[str, Form()] = "square",
-    foreground: Annotated[str, Form()] = "#000000",
-    background: Annotated[str, Form()] = "#ffffff",
-    gradient: Annotated[str, Form()] = "none",
-    gradient_to: Annotated[str, Form()] = "#000000",
-    error_correction: Annotated[str, Form()] = DEFAULT_EC,
-    box_size: Annotated[int, Form()] = 10,
-    border: Annotated[int, Form()] = 4,
-    image_format: Annotated[str, Form()] = PNG,
-    logo: Annotated[UploadFile | None, File()] = None,
-    logo_ratio: Annotated[float, Form()] = 0.2,
-    transparent_background: Annotated[bool, Form()] = False,
-    frame_color: Annotated[str | None, Form()] = None,
-    title: Annotated[str, Form()] = "",
-    subtitle: Annotated[str, Form()] = "",
-) -> Response:
-    payload = await _resolve_input(data, file)
-    logo_image = await _read_logo(logo)
-    config = _build_config(
-        payload.content, style, foreground, background, gradient, gradient_to,
-        error_correction, box_size, border, image_format, logo_image,
-        logo_ratio, transparent_background, frame_color, title, subtitle,
-    )
-    try:
-        result = await run_in_threadpool(generate_qr, config)
-    except InvalidInput as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    client_id = getattr(request.state, "client_id", None)
-    background_tasks.add_task(inputs.persist_input, client_id, payload)
-
-    headers = {"X-QR-Warnings": "; ".join(result.warnings)}
-    return Response(
-        content=result.content,
-        media_type=MEDIA_TYPES[result.image_format],
-        headers=headers,
-    )
-
-
-app.include_router(admin_router)
+app = build_app()
 
 
 def main() -> int:
@@ -520,10 +374,10 @@ def run(host: str | None = None, port: int | None = None) -> int:
     port = port or int(os.environ.get("PORT", "8000"))
 
     print(f"QR Generator web UI: http://{host}:{port}")
-    # Single worker on purpose: MAX_INFLIGHT_BODY_BYTES is a process-wide
-    # counter and the tmpfs budget is per container. Several workers would
-    # each enforce their own cap over the same /tmp. Scale out with
-    # separate container replicas instead.
+    # Single worker on purpose: the in-flight body budget is process-wide
+    # (one BodyGate ledger) and the tmpfs budget is per container. Several
+    # workers would each enforce their own cap over the same /tmp. Scale
+    # out with separate container replicas instead.
     uvicorn.run(app, host=host, port=port, workers=1)
     return 0
 

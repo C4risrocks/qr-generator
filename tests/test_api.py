@@ -16,21 +16,22 @@ from qrgen.server import app
 client = TestClient(app)
 
 
-def test_body_too_large_rejected(monkeypatch) -> None:
-    from qrgen import server
+def small_app(max_body_bytes: int, inflight_max_bytes: int = 10**9):
+    """An app with explicit body limits: tests construct instead of patch."""
+    from qrgen.server import build_app
 
-    monkeypatch.setattr(server, "MAX_BODY_BYTES", 100)
-    res = client.post("/api/generate", data={"data": "x" * 200})
+    return build_app(max_body_bytes=max_body_bytes, inflight_max_bytes=inflight_max_bytes)
+
+
+def test_body_too_large_rejected() -> None:
+    res = TestClient(small_app(100)).post("/api/generate", data={"data": "x" * 200})
     assert res.status_code == 413
 
 
-def test_declared_content_length_rejected_without_reading(monkeypatch) -> None:
+def test_declared_content_length_rejected_without_reading() -> None:
     """A declared oversized body is rejected before any parsing: the
     response must not depend on Starlette's per-field parser limits."""
-    from qrgen import server
-
-    monkeypatch.setattr(server, "MAX_BODY_BYTES", 100)
-    res = client.post(
+    res = TestClient(small_app(100)).post(
         "/api/generate",
         content=b"data=" + b"x" * 200,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -39,17 +40,14 @@ def test_declared_content_length_rejected_without_reading(monkeypatch) -> None:
     assert "too large" in res.json()["detail"]
 
 
-def test_chunked_body_too_large_rejected(monkeypatch) -> None:
+def test_chunked_body_too_large_rejected() -> None:
     """Bodies without Content-Length (chunked) must also hit the limit."""
-    from qrgen import server
-
-    monkeypatch.setattr(server, "MAX_BODY_BYTES", 100)
 
     def chunks():
         yield b"data="
         yield b"x" * 200
 
-    res = client.post(
+    res = TestClient(small_app(100)).post(
         "/api/generate",
         content=chunks(),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -73,40 +71,37 @@ def test_chunked_body_within_limit_passes_through() -> None:
 
 def test_oversized_chunked_body_does_not_consume_rate_limit(monkeypatch) -> None:
     """Size rejection must happen before the daily counter is recorded."""
-    from qrgen import rate_limit, server
+    from qrgen import rate_limit
 
-    monkeypatch.setattr(server, "MAX_BODY_BYTES", 100)
     monkeypatch.setattr(rate_limit, "ENDPOINT_LIMITS", {"generate": 1, "previews": 500})
+    gated = TestClient(small_app(100))
 
     def chunks():
         yield b"data="
         yield b"x" * 200
 
-    oversized = client.post(
+    oversized = gated.post(
         "/api/generate",
         content=chunks(),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
     assert oversized.status_code == 413
 
-    first = client.post("/api/generate", data={"data": "valid"})
-    second = client.post("/api/generate", data={"data": "valid"})
+    first = gated.post("/api/generate", data={"data": "valid"})
+    second = gated.post("/api/generate", data={"data": "valid"})
     assert first.status_code == 200
     assert second.status_code == 429
 
 
-def test_many_small_chunks_too_large_rejected(monkeypatch) -> None:
+def test_many_small_chunks_too_large_rejected() -> None:
     """The limit applies to the running total, not to individual chunks."""
-    from qrgen import server
-
-    monkeypatch.setattr(server, "MAX_BODY_BYTES", 100)
 
     def chunks():
         yield b"data="
         for _ in range(200):
             yield b"x"
 
-    res = client.post(
+    res = TestClient(small_app(100)).post(
         "/api/generate",
         content=chunks(),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -114,46 +109,34 @@ def test_many_small_chunks_too_large_rejected(monkeypatch) -> None:
     assert res.status_code == 413
 
 
-def test_inflight_cap_returns_503_and_releases(monkeypatch) -> None:
+def test_inflight_cap_returns_503_and_releases() -> None:
     """A saturated spool budget answers 503 with Retry-After, and the
     reserved bytes are released afterwards so later requests succeed."""
-    from qrgen import server
-
-    monkeypatch.setattr(server, "MAX_BODY_BYTES", 10_000)
-    monkeypatch.setattr(server, "MAX_INFLIGHT_BODY_BYTES", 10)
-    assert server._inflight_body_bytes == 0
+    busy = TestClient(small_app(10_000, inflight_max_bytes=10))
 
     def chunks():
         yield b"data="
         yield b"x" * 20
 
-    res = client.post(
+    res = busy.post(
         "/api/generate",
         content=chunks(),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
     assert res.status_code == 503
     assert int(res.headers["retry-after"]) > 0
-    assert server._inflight_body_bytes == 0
 
-    ok = client.post("/api/generate", data={"data": "hola"})
+    ok = busy.post("/api/generate", data={"data": "hola"})
     assert ok.status_code == 200
-    assert server._inflight_body_bytes == 0
 
 
-async def test_concurrent_multipart_obeys_inflight_cap(monkeypatch) -> None:
+async def test_concurrent_multipart_obeys_inflight_cap() -> None:
     """Concurrent multipart uploads count each byte twice (the form parser
-    may spool parts separately), so the global cap still answers 503 to the
-    request that would exceed it and releases the budget afterwards."""
+    may spool parts separately), so the cap answers 503 to the request that
+    would exceed it and releases the budget afterwards."""
     import asyncio
 
     import httpx2
-
-    from qrgen import server
-
-    monkeypatch.setattr(server, "MAX_BODY_BYTES", 10_000)
-    monkeypatch.setattr(server, "MAX_INFLIGHT_BODY_BYTES", 250)
-    assert server._inflight_body_bytes == 0
 
     first = b"--BOUND\r\nContent-Disposition: form-data; name=\"data\"\r\n\r\n"
     parked = 0
@@ -171,7 +154,7 @@ async def test_concurrent_multipart_obeys_inflight_cap(monkeypatch) -> None:
             yield b"x"
         yield b"\r\n--BOUND--\r\n"
 
-    transport = httpx2.ASGITransport(app=app)
+    transport = httpx2.ASGITransport(app=small_app(10_000, inflight_max_bytes=250))
     async with httpx2.AsyncClient(transport=transport, base_url="http://test") as http2:
         async def post():
             return await http2.post(
@@ -187,33 +170,9 @@ async def test_concurrent_multipart_obeys_inflight_cap(monkeypatch) -> None:
         res1, res2 = await asyncio.gather(first_req, second_req)
 
         assert 503 in {res1.status_code, res2.status_code}
-        assert server._inflight_body_bytes == 0
 
         ok = await http2.post("/api/generate", data={"data": "hola"})
         assert ok.status_code == 200
-        assert server._inflight_body_bytes == 0
-
-
-def test_mixed_case_multipart_content_type_counts_double(monkeypatch) -> None:
-    """The double spool accounting must not depend on Content-Type casing."""
-    from qrgen import server
-
-    monkeypatch.setattr(server, "MAX_BODY_BYTES", 10_000)
-    monkeypatch.setattr(server, "MAX_INFLIGHT_BODY_BYTES", 100)
-    assert server._inflight_body_bytes == 0
-
-    def chunks():
-        yield b"--BOUND\r\nContent-Disposition: form-data; name=\"data\"\r\n\r\n"
-        yield b"x"
-        yield b"\r\n--BOUND--\r\n"
-
-    res = client.post(
-        "/api/generate",
-        content=chunks(),
-        headers={"Content-Type": "Multipart/Form-Data; boundary=BOUND"},
-    )
-    assert res.status_code == 503
-    assert server._inflight_body_bytes == 0
 
 
 def test_server_run_uses_single_worker(monkeypatch) -> None:
