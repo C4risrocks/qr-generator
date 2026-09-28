@@ -360,9 +360,9 @@ def test_previews_rejects_bad_style() -> None:
     assert res.status_code == 400
 
 
-def test_previews_svg_reports_fallback_warnings() -> None:
-    """In SVG mode previews must mirror the export fallbacks (squares for
-    unsupported styles, solid foreground for gradients) and warn about them."""
+def test_previews_svg_render_natively() -> None:
+    """SVG previews mirror the real export: every style renders, no
+    fallback warnings, gradient included."""
     res = client.post(
         "/api/previews",
         data={
@@ -376,8 +376,8 @@ def test_previews_svg_reports_fallback_warnings() -> None:
     assert res.status_code == 200
     payload = res.json()
     assert payload["selected"]["style"] == "rounded"
-    assert any("not available in SVG" in w for w in payload["warnings"])
-    assert any("gradients are not available in SVG" in w for w in payload["warnings"])
+    assert not any("not available in SVG" in w for w in payload["warnings"])
+    assert not any("gradients are not available" in w for w in payload["warnings"])
 
 
 def test_previews_svg_omits_png_only_options() -> None:
@@ -394,8 +394,8 @@ def test_previews_svg_omits_png_only_options() -> None:
 
 
 def test_generate_svg_omits_png_only_options() -> None:
-    """A non-UI API client sending PNG-only options with SVG gets an SVG
-    export with the options omitted, not a 400."""
+    """A non-UI API client sending raster-only options with SVG gets an SVG
+    export with those omitted; transparency is native and kept."""
     big_logo = Image.new("RGB", (64, 64), (0, 255, 0))
     res = client.post(
         "/api/generate",
@@ -413,10 +413,10 @@ def test_generate_svg_omits_png_only_options() -> None:
     assert "svg" in res.headers["content-type"]
     warnings = res.headers.get("x-qr-warnings", "")
     assert "logo is not available in SVG" in warnings
-    assert "transparent background is not available in SVG" in warnings
     assert "frame is not available in SVG" in warnings
     assert "title is not available in SVG" in warnings
     assert "subtitle is not available in SVG" in warnings
+    assert "transparent" not in warnings
 
 
 WEB_PAYLOAD = {

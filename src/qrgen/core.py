@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from dataclasses import fields as dataclass_fields
@@ -78,24 +79,19 @@ class StyleInfo:
 STYLE_INFO: tuple[StyleInfo, ...] = (
     StyleInfo(STYLE_SQUARE, "Cuadrado", "Forma clásica, máxima compatibilidad de lectura", True, True),
     StyleInfo(STYLE_GAPPED, "Cuadrado separado", "Módulos con aire entre sí", True, True),
-    StyleInfo(STYLE_ROUNDED, "Redondeado", "Esquinas suaves, aspecto moderno", True, False),
+    StyleInfo(STYLE_ROUNDED, "Redondeado", "Esquinas suaves, aspecto moderno", True, True),
     StyleInfo(STYLE_CIRCLES, "Círculos", "Módulos circulares continuos", True, True),
     StyleInfo(STYLE_DOTS, "Puntos", "Módulos circulares pequeños", True, True),
-    StyleInfo(STYLE_VERTICAL_BARS, "Barras verticales", "Barras verticales continuas", True, False),
-    StyleInfo(STYLE_HORIZONTAL_BARS, "Barras horizontales", "Barras horizontales continuas", True, False),
+    StyleInfo(STYLE_VERTICAL_BARS, "Barras verticales", "Barras verticales continuas", True, True),
+    StyleInfo(STYLE_HORIZONTAL_BARS, "Barras horizontales", "Barras horizontales continuas", True, True),
 )
 STYLES = tuple(info.id for info in STYLE_INFO)
 STYLE_LABELS = {info.id: info.label for info in STYLE_INFO}
-SVG_CAPABLE_STYLES = frozenset(info.id for info in STYLE_INFO if info.svg)
-# Single source of truth for the SVG fallbacks, shared by previews and export.
-SVG_STYLE_FALLBACK_WARNING = "is not available in SVG; using plain squares"
-SVG_GRADIENT_FALLBACK_WARNING = "gradients are not available in SVG; using solid foreground"
 
 
 def _preview_style(style: str, svg_mode: bool) -> str:
-    """Style actually rendered in previews, mirroring the SVG export fallback."""
-    if svg_mode and style not in SVG_CAPABLE_STYLES:
-        return STYLE_SQUARE
+    """Style actually rendered in previews: SVG now supports every style,
+    so previews always mirror the requested one."""
     return style
 
 GRADIENT_INFO = (
@@ -232,12 +228,210 @@ def build_svg_drawer(style: str):
     return {
         STYLE_SQUARE: svg_drawers.SvgPathSquareDrawer,
         STYLE_GAPPED: svg_drawers.SvgPathSquareDrawer,
+        STYLE_ROUNDED: SvgPathRoundedDrawer,
         STYLE_CIRCLES: svg_drawers.SvgPathCircleDrawer,
         STYLE_DOTS: svg_drawers.SvgPathCircleDrawer,
-    }.get(
-        style,
-        svg_drawers.SvgPathSquareDrawer,
-    )(size_ratio=Decimal("0.7") if style in (STYLE_GAPPED, STYLE_DOTS) else Decimal(1))
+        STYLE_VERTICAL_BARS: SvgPathVerticalBarsDrawer,
+        STYLE_HORIZONTAL_BARS: SvgPathHorizontalBarsDrawer,
+    }[style](
+        size_ratio=Decimal("0.7") if style in (STYLE_GAPPED, STYLE_DOTS) else Decimal(1)
+    )
+
+
+class SvgPathRoundedDrawer(svg_drawers.SvgPathSquareDrawer):
+    """Rounded corners where both adjacent neighbours are empty, mirroring
+    the PIL RoundedModuleDrawer (radius half a module, ratio 1)."""
+
+    needs_neighbors = True
+
+    def drawrect(self, box, is_active):
+        if not is_active:
+            return
+        self._active = is_active
+        self.img._subpaths.append(self.subpath(box))
+
+    def subpath(self, box) -> str:
+        coords = self.coords(box)
+        x0 = self.img.units(coords.x0, text=False)
+        y0 = self.img.units(coords.y0, text=False)
+        x1 = self.img.units(coords.x1, text=False)
+        y1 = self.img.units(coords.y1, text=False)
+        r = self.img.units(self.box_half, text=False)
+        active = self._active
+        nw = r if not (active.W or active.N) else Decimal(0)
+        ne = r if not (active.N or active.E) else Decimal(0)
+        se = r if not (active.E or active.S) else Decimal(0)
+        sw = r if not (active.S or active.W) else Decimal(0)
+
+        path = f"M{x0 + nw},{y0}H{x1 - ne}"
+        if ne:
+            path += f"A{ne},{ne} 0 0 1 {x1},{y0 + ne}"
+        path += f"V{y1 - se}"
+        if se:
+            path += f"A{se},{se} 0 0 1 {x1 - se},{y1}"
+        path += f"H{x0 + sw}"
+        if sw:
+            path += f"A{sw},{sw} 0 0 1 {x0},{y1 - sw}"
+        path += f"V{y0 + nw}"
+        if nw:
+            path += f"A{nw},{nw} 0 0 1 {x0 + nw},{y0}"
+        return path + "z"
+
+
+class SvgPathVerticalBarsDrawer(svg_drawers.SvgPathSquareDrawer):
+    """Vertical contiguous runs as 0.8-wide bars with semicircular caps on
+    the free ends, mirroring the PIL VerticalBarsDrawer."""
+
+    needs_neighbors = True
+
+    def __init__(self, *, horizontal_shrink: Decimal = Decimal("0.8"), **kwargs):
+        self.horizontal_shrink = Decimal(horizontal_shrink)
+        super().__init__(**kwargs)
+
+    def drawrect(self, box, is_active):
+        if not is_active:
+            return
+        self._active = is_active
+        self.img._subpaths.append(self.subpath(box))
+
+    def subpath(self, box) -> str:
+        coords = self.coords(box)
+        x0 = self.img.units(coords.x0, text=False)
+        y0 = self.img.units(coords.y0, text=False)
+        x1 = self.img.units(coords.x1, text=False)
+        y1 = self.img.units(coords.y1, text=False)
+        active = self._active
+        half = (y1 - y0) / 2
+        delta = (1 - self.horizontal_shrink) * half
+        bx0, bx1 = x0 + delta, x1 - delta
+        rx = (bx1 - bx0) / 2
+        mid = y0 + half
+        # top half: rounded cap when there is no neighbour above
+        top = (
+            f"M{bx0},{mid}A{rx},{half} 0 0 1 {bx1},{mid}z"
+            if not active.N
+            else f"M{bx0},{y0}H{bx1}V{mid}H{bx0}z"
+        )
+        bottom = (
+            f"M{bx0},{mid}A{rx},{half} 0 0 0 {bx1},{mid}z"
+            if not active.S
+            else f"M{bx0},{mid}H{bx1}V{y1}H{bx0}z"
+        )
+        return top + bottom
+
+
+class SvgPathHorizontalBarsDrawer(svg_drawers.SvgPathSquareDrawer):
+    """Horizontal contiguous runs as 0.8-tall bars with semicircular caps
+    on the free ends, mirroring the PIL HorizontalBarsDrawer."""
+
+    needs_neighbors = True
+
+    def __init__(self, *, vertical_shrink: Decimal = Decimal("0.8"), **kwargs):
+        self.vertical_shrink = Decimal(vertical_shrink)
+        super().__init__(**kwargs)
+
+    def drawrect(self, box, is_active):
+        if not is_active:
+            return
+        self._active = is_active
+        self.img._subpaths.append(self.subpath(box))
+
+    def subpath(self, box) -> str:
+        coords = self.coords(box)
+        x0 = self.img.units(coords.x0, text=False)
+        y0 = self.img.units(coords.y0, text=False)
+        x1 = self.img.units(coords.x1, text=False)
+        y1 = self.img.units(coords.y1, text=False)
+        active = self._active
+        half = (x1 - x0) / 2
+        delta = (1 - self.vertical_shrink) * half
+        by0, by1 = y0 + delta, y1 - delta
+        ry = (by1 - by0) / 2
+        mid = x0 + half
+        left = (
+            f"M{mid},{by0}A{half},{ry} 0 0 0 {mid},{by1}z"
+            if not active.W
+            else f"M{x0},{by0}H{mid}V{by1}H{x0}z"
+        )
+        right = (
+            f"M{mid},{by0}A{half},{ry} 0 0 1 {mid},{by1}z"
+            if not active.E
+            else f"M{mid},{by0}H{x1}V{by1}H{mid}z"
+        )
+        return left + right
+
+
+class QrSvgPathImage(SvgPathImage):
+    """SvgPathImage that actually honours the requested colours.
+
+    The upstream factory forwards unknown kwargs (``fill_color``,
+    ``back_color``) as SVG attributes — an invalid XML attribute — while
+    the path stays hardcoded black. This subclass consumes them instead:
+    it paints the background rect (``back_color=None`` keeps the
+    background transparent, native SVG) and fills the QR path either with
+    the solid foreground or with a native ``<defs>`` gradient.
+    """
+
+    paint_hex: str = "#000000"
+    back_hex: str | None = None
+    gradient_kind: str = GRADIENT_NONE
+    gradient_to_hex: str | None = None
+
+    def __init__(self, *args, **kwargs):
+        # Consume our colour/gradient kwargs here so they never leak into
+        # the SVG element as invalid attributes.
+        self.paint_hex = kwargs.pop("fill_color", self.paint_hex)
+        self.back_hex = kwargs.pop("back_color", self.back_hex)
+        self.gradient_kind = kwargs.pop("gradient_kind", self.gradient_kind)
+        self.gradient_to_hex = kwargs.pop("gradient_to_hex", self.gradient_to_hex)
+        super().__init__(*args, **kwargs)
+
+    def _svg(self, viewBox=None, **kwargs):
+        svg = super()._svg(viewBox=viewBox, **kwargs)
+        if self.back_hex:
+            svg.append(
+                ET.Element(
+                    ET.QName("rect"),
+                    {"fill": self.back_hex, "x": "0", "y": "0",
+                     "width": "100%", "height": "100%"},
+                )
+            )
+        if self.gradient_kind != GRADIENT_NONE:
+            svg.append(self._gradient_defs())
+        return svg
+
+    def _gradient_defs(self) -> ET.Element:
+        colors = (self.paint_hex, self.gradient_to_hex or self.paint_hex)
+        if self.gradient_kind == GRADIENT_LINEAR_H:
+            grad = ET.Element(
+                ET.QName("linearGradient"),
+                {"id": "qr-fill", "x1": "0", "y1": "0", "x2": "1", "y2": "0"},
+            )
+        elif self.gradient_kind == GRADIENT_LINEAR_V:
+            grad = ET.Element(
+                ET.QName("linearGradient"),
+                {"id": "qr-fill", "x1": "0", "y1": "0", "x2": "0", "y2": "1"},
+            )
+        else:  # radial
+            grad = ET.Element(
+                ET.QName("radialGradient"),
+                {"id": "qr-fill", "cx": "0.5", "cy": "0.5", "r": "0.5"},
+            )
+        for offset, color in (("0", colors[0]), ("1", colors[1])):
+            grad.append(
+                ET.Element(ET.QName("stop"), {"offset": offset, "stop-color": color})
+            )
+        defs = ET.Element(ET.QName("defs"))
+        defs.append(grad)
+        return defs
+
+    def process(self):
+        super().process()
+        if self.path is not None:
+            if self.gradient_kind != GRADIENT_NONE:
+                self.path.set("fill", "url(#qr-fill)")
+            else:
+                self.path.set("fill", self.paint_hex)
 
 
 @dataclass(frozen=True)
@@ -576,17 +770,15 @@ def _parse_config(
 
 
 def omit_png_only_options(config: QRConfig) -> tuple[QRConfig, tuple[str, ...]]:
-    """SVG output cannot carry a logo, transparency, frame or text; return a
-    config with those options reset (omitted, not rejected) plus one warning
-    per dropped option, so every client gets the same lenient treatment the
-    web UI applies before exporting."""
+    """SVG output cannot carry a logo, frame or text; return a config with
+    those options reset (omitted, not rejected) plus one warning per
+    dropped option. Transparency is native in SVG, so it is kept.
+    """
     if config.image_format != SVG:
         return config, ()
     dropped: list[str] = []
     if config.logo is not None:
         dropped.append("logo is not available in SVG; omitted")
-    if config.transparent_background:
-        dropped.append("transparent background is not available in SVG; using solid background")
     if config.frame_color is not None:
         dropped.append("frame is not available in SVG; omitted")
     if config.title.strip():
@@ -596,7 +788,6 @@ def omit_png_only_options(config: QRConfig) -> tuple[QRConfig, tuple[str, ...]]:
     coerced = replace(
         config,
         logo=None,
-        transparent_background=False,
         frame_color=None,
         title="",
         subtitle="",
@@ -656,24 +847,24 @@ def _render_png(
     return qr.make_image(image_factory=StyledPilImage, **kwargs).get_image()
 
 
+def _hex(rgb: tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
 def _render_svg(
     qr: QRCode,
     config: QRConfig,
     fg: tuple[int, int, int],
     bg: tuple[int, int, int],
-    warnings: list[str],
+    gt: tuple[int, int, int],
 ) -> bytes:
-    if config.style not in SVG_CAPABLE_STYLES:
-        warnings.append(
-            f"style {STYLE_LABELS[config.style]} {SVG_STYLE_FALLBACK_WARNING}"
-        )
-    if config.gradient != GRADIENT_NONE:
-        warnings.append(SVG_GRADIENT_FALLBACK_WARNING)
     img = qr.make_image(
-        image_factory=SvgPathImage,
+        image_factory=QrSvgPathImage,
         module_drawer=build_svg_drawer(config.style),
-        fill_color=fg,
-        back_color=bg,
+        fill_color=_hex(fg),
+        back_color=None if config.transparent_background else _hex(bg),
+        gradient_kind=config.gradient,
+        gradient_to_hex=_hex(gt),
     )
     return img.to_string(encoding="unicode").encode("utf-8")
 
@@ -760,7 +951,7 @@ def generate_qr(config: QRConfig) -> QRResult:
             img = _compose_frame(img, config, fg, bg)
         content = _png_bytes(img)
     else:
-        content = _render_svg(qr, config, fg, bg, warnings)
+        content = _render_svg(qr, config, fg, bg, gt)
 
     return QRResult(content=content, image_format=config.image_format, warnings=tuple(warnings))
 
@@ -779,11 +970,10 @@ def generate_previews(config: QRConfig) -> tuple[list[Preview], Preview, tuple[s
     the selected preview applies the real style, frame, title, subtitle, border
     and a capped box size so it matches the final download visually.
 
-    When SVG output is requested, PNG-only options (logo, transparency,
-    frame and text) are omitted exactly like the real SVG export, thumbnails
-    use the same fallbacks (plain squares for unsupported styles, solid
-    foreground for gradients) and the warnings match, so the preview never
-    shows something the download cannot produce.
+    When SVG output is requested, raster-only options (logo, frame and
+    text) are omitted exactly like the real SVG export; every style and
+    the gradient render natively in SVG now, so thumbnails show the real
+    style with no fallbacks and the warnings match the download.
     """
     config, omitted = omit_png_only_options(config)
     if config.style not in STYLES:
@@ -793,7 +983,6 @@ def generate_previews(config: QRConfig) -> tuple[list[Preview], Preview, tuple[s
     # Validate the coerced configuration (sizes, colors), so previews and
     # downloads accept and reject the same inputs.
     _parse_config(config)
-    svg_mode = config.image_format == SVG
     base = replace(
         config,
         style=STYLE_SQUARE,
@@ -807,14 +996,6 @@ def generate_previews(config: QRConfig) -> tuple[list[Preview], Preview, tuple[s
     fg, bg, gt, warnings = _parse_config(base)
     warnings = list(warnings)
     warnings.extend(omitted)
-    if svg_mode:
-        if config.style not in SVG_CAPABLE_STYLES:
-            warnings.append(
-                f"style {STYLE_LABELS[config.style]} {SVG_STYLE_FALLBACK_WARNING}"
-            )
-        if config.gradient != GRADIENT_NONE:
-            warnings.append(SVG_GRADIENT_FALLBACK_WARNING)
-            gt = fg
     error_correction = _resolve_error_correction(base, warnings)
     qr = _build_matrix(base, error_correction)
 
@@ -822,7 +1003,7 @@ def generate_previews(config: QRConfig) -> tuple[list[Preview], Preview, tuple[s
         Preview(
             style=style,
             content=_png_bytes(
-                _render_png(qr, replace(base, style=_preview_style(style, svg_mode)), fg, bg, gt)
+                _render_png(qr, replace(base, style=style), fg, bg, gt)
             ),
         )
         for style in STYLES
@@ -830,7 +1011,7 @@ def generate_previews(config: QRConfig) -> tuple[list[Preview], Preview, tuple[s
 
     selected_config = replace(
         config,
-        style=_preview_style(config.style, svg_mode),
+        style=config.style,
         image_format=PNG,
         box_size=min(max(config.box_size, 5), 12),
     )

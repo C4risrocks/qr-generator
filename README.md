@@ -311,10 +311,11 @@ Recomendada cuando se necesiten releases versionadas o rollback exacto.
 
 ## Notas
 
-- En SVG los estilos `rounded`, `vertical-bars` y `horizontal-bars` caen a
-  cuadrados simples, y los gradientes a color sólido (con aviso).
-- El logo, el fondo transparente, el marco y el texto solo se admiten en
-  PNG. En `/api/generate` y `/api/previews`, una petición SVG que los incluya
+- SVG soporta todos los estilos nativamente (`rounded`, `vertical-bars` y
+  `horizontal-bars` incluidos, dibujados como rutas con arcos) y los
+  gradientes (definidos como `<linearGradient>`/`<radialGradient>`); el
+  fondo transparente también es nativo.
+- El logo, el marco y el texto solo se admiten en PNG (composición raster). En `/api/generate` y `/api/previews`, una petición SVG que los incluya
   no se rechaza: esas opciones se omiten y se avisa por `X-QR-Warnings`
   (la web además avisa antes de exportar).
 - El contenido de los inputs se guarda en `qr_inputs` con hash SHA-256 y se

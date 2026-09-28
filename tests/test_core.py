@@ -64,16 +64,20 @@ def test_svg_renders_valid_xml() -> None:
 
 
 @pytest.mark.parametrize("style", ("rounded", "vertical-bars", "horizontal-bars"))
-def test_svg_falls_back_with_warning(style: str) -> None:
+def test_svg_renders_every_style_natively(style: str) -> None:
+    """Formerly PNG-only styles now render real SVG with no fallback."""
     result = generate_qr(make_config(image_format=SVG, style=style))
-    assert any("not available in SVG" in w for w in result.warnings)
+    assert not any("not available in SVG" in w for w in result.warnings)
+    assert result.content.lstrip().startswith(b"<")
 
 
-def test_svg_gradient_falls_back_with_warning() -> None:
+def test_svg_gradient_renders_natively() -> None:
     result = generate_qr(
         make_config(image_format=SVG, gradient="linear-h", gradient_to="#0000ff")
     )
-    assert any("gradients are not available in SVG" in w for w in result.warnings)
+    assert not any("gradients are not available" in w for w in result.warnings)
+    assert b"url(#qr-fill)" in result.content
+    assert b'stop-color="#0000ff"' in result.content
 
 
 def test_custom_colors_applied() -> None:
@@ -116,11 +120,11 @@ def test_transparent_background_renders_rgba() -> None:
     assert corner[3] == 0
 
 
-def test_transparent_background_omitted_for_svg() -> None:
+def test_transparent_background_native_in_svg() -> None:
+    """Transparency is native SVG now: no warning, no background rect."""
     result = generate_qr(make_config(image_format=SVG, transparent_background=True))
-    assert any(
-        "transparent background is not available in SVG" in w for w in result.warnings
-    )
+    assert not any("transparent" in w for w in result.warnings)
+    assert b"<rect" not in result.content
 
 
 def test_frame_and_title_omitted_for_svg() -> None:

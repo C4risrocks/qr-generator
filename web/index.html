@@ -853,10 +853,10 @@
       form.append("border", state.border);
       form.append("image_format", state.format);
       if (state.format === "svg") {
-        // SVG does not support these PNG-only options; omit them instead of
-        // sending values the API would reject with 400. State is preserved
-        // so switching back to PNG restores the previous configuration.
-        form.append("transparent_background", false);
+        // SVG cannot raster-composite the logo, frame or text: omit them.
+        // Transparency is native SVG, so it travels as configured. State is
+        // preserved so switching back to PNG restores the configuration.
+        form.append("transparent_background", state.transparent);
         form.append("frame_color", "");
         form.append("title", "");
         form.append("subtitle", "");
@@ -984,9 +984,7 @@
       const styleInfo = catalog.styles.find((s) => s.id === state.style);
       const notes = [];
       if (state.format === "svg") {
-        if (styleInfo && !styleInfo.svg) notes.push("Este estilo no está disponible en SVG; se usará cuadrado simple.");
-        if (state.gradient !== "none") notes.push("Los gradientes no están disponibles en SVG; se usará color sólido.");
-        notes.push("El logo, la transparencia, el marco y el texto están desactivados en SVG.");
+        notes.push("El logo, el marco y el texto están desactivados en SVG.");
       }
       if (state.transparent && (state.frame || state.title || state.subtitle)) {
         notes.push("El marco y el texto requieren un fondo sólido; desactiva la transparencia.");

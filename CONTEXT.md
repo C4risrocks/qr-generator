@@ -15,13 +15,15 @@ actualízalo aquí (ver skill domain-modeling).
 - **payload**: el `InputPayload` resuelto (contenido + tipo + filename
   opcional) entregado por la resolución de *input*.
 - **style**: forma de los módulos (`square`, `gapped`, `rounded`,
-  `circles`, `dots`, `vertical-bars`, `horizontal-bars`). Algunos no
-  existen en SVG y caen a cuadrados con aviso.
+  `circles`, `dots`, `vertical-bars`, `horizontal-bars`). Todos existen
+  en SVG (los tres últimos son rutas SVG con arcos definidas en
+  `core.py`, espejo de los drawers PIL).
 - **palette / preset**: combinaciones predefinidas de colores
   (*palette*) y de configuración completa (*preset*) que consume el
   catálogo (`/api/catalog`) y la web.
 - **gradient**: relleno de módulos (`none`, `linear-h`, `linear-v`,
-  `radial`); no disponible en SVG (cae a color sólido con aviso).
+  `radial`); nativo en SVG vía `<defs>` (`QrSvgPathImage`), raster en
+  PNG vía *color masks*.
 - **logo**: imagen incrustada al centro (≤ 5 MB de subida, ratio ≤ 0.3).
   Fuerza corrección de error `H`. PNG-only en la salida. El editor web
   puede **rotar** (90° por transposición, sin pérdida) y **recortar**
