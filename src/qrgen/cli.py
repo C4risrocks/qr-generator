@@ -79,6 +79,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="error correction level (default: M)",
     )
     parser.add_argument("--box-size", type=int, default=10, help="pixels per module (default: 10)")
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="output side length in pixels (1-4096); overrides --box-size when given",
+    )
     parser.add_argument("--border", type=int, default=4, help="quiet zone width in modules (default: 4)")
     parser.add_argument("--logo", metavar="PATH", help="image to embed in the center (forces error correction H)")
     parser.add_argument(
@@ -156,6 +163,7 @@ def run_generate(argv: list[str]) -> int:
             "error_correction": args.error_correction,
             "box_size": args.box_size,
             "border": args.border,
+            "resolution": args.resolution,
             "image_format": image_format,
             "logo_ratio": args.logo_ratio,
             "transparent_background": args.transparent_background,

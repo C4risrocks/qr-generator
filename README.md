@@ -77,6 +77,7 @@ uv run qrgen-serve
 | `--transparent-background` | Fondo transparente (PNG) |
 | `-e, --error-correction` | `L`, `M`, `Q` o `H` (por defecto `M`) |
 | `--box-size` | Píxeles por módulo (por defecto `10`) |
+| `--resolution` | Lado final en píxeles (1-4096); anula `--box-size` cuando se indica |
 | `--border` | Margen de seguridad en módulos (por defecto `4`) |
 | `--logo` | Imagen a incrustar en el centro (fuerza corrección `H`) |
 | `--logo-ratio` | Tamaño del logo como proporción del QR (por defecto `0.2`) |

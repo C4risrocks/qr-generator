@@ -63,6 +63,7 @@ MIN_CONTRAST_RATIO = 3.0
 MAX_LOGO_RATIO = 0.3
 MAX_LOGO_DIMENSIONS = 1024
 MAX_DATA_LENGTH = 2048
+MAX_RESOLUTION = 4096
 
 MEDIA_TYPES = {PNG: "image/png", SVG: "image/svg+xml"}
 
@@ -376,6 +377,7 @@ class QrSvgPathImage(SvgPathImage):
     back_hex: str | None = None
     gradient_kind: str = GRADIENT_NONE
     gradient_to_hex: str | None = None
+    pixel_size_px: int | None = None
 
     def __init__(self, *args, **kwargs):
         # Consume our colour/gradient kwargs here so they never leak into
@@ -384,6 +386,7 @@ class QrSvgPathImage(SvgPathImage):
         self.back_hex = kwargs.pop("back_color", self.back_hex)
         self.gradient_kind = kwargs.pop("gradient_kind", self.gradient_kind)
         self.gradient_to_hex = kwargs.pop("gradient_to_hex", self.gradient_to_hex)
+        self.pixel_size_px = kwargs.pop("pixel_size_px", self.pixel_size_px)
         super().__init__(*args, **kwargs)
 
     def _svg(self, viewBox=None, **kwargs):
@@ -398,6 +401,11 @@ class QrSvgPathImage(SvgPathImage):
             )
         if self.gradient_kind != GRADIENT_NONE:
             svg.append(self._gradient_defs())
+        if self.pixel_size_px is not None:
+            # intrinsic size in px (unitless = px); the viewBox stays
+            # module-based so the SVG keeps scaling freely
+            svg.set("width", str(self.pixel_size_px))
+            svg.set("height", str(self.pixel_size_px))
         return svg
 
     def _gradient_defs(self) -> ET.Element:
@@ -454,6 +462,7 @@ class QRConfig:
     frame_color: str | None = None
     title: str = ""
     subtitle: str = ""
+    resolution: int | None = None
 
 
 # The dataclass declaration IS the option contract: parse_options derives
@@ -476,6 +485,14 @@ def _coerce_option(name: str, raw: Any, expected: Any) -> Any:
         if text in _FALSE_STRINGS:
             return False
         raise InvalidInput(f"{name} must be a boolean")
+    args = get_args(expected)
+    if args and type(None) in args:
+        # Optional[X]: "" and None mean "not provided"; otherwise coerce to
+        # the inner type so int|None fields get real ints.
+        if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+            return None
+        inner = next(a for a in args if a is not type(None))
+        return _coerce_option(name, raw, inner)
     if expected is int:
         if isinstance(raw, int) and not isinstance(raw, bool):
             return raw
@@ -491,13 +508,8 @@ def _coerce_option(name: str, raw: Any, expected: Any) -> Any:
         except ValueError as exc:
             raise InvalidInput(f"{name} must be a number") from exc
     if raw is None:
-        if type(None) in get_args(expected):
-            return None
         raise InvalidInput(f"{name} must not be empty")
-    text = raw if isinstance(raw, str) else str(raw)
-    if type(None) in get_args(expected) and text == "":
-        return None
-    return text
+    return raw if isinstance(raw, str) else str(raw)
 
 
 def parse_options(source: Mapping[str, Any], /, **overrides: Any) -> QRConfig:
@@ -743,6 +755,10 @@ def _parse_config(
         raise InvalidInput("border must be >= 0")
     if not 0 < config.logo_ratio <= MAX_LOGO_RATIO:
         raise InvalidInput(f"logo_ratio must be between 0 and {MAX_LOGO_RATIO}")
+    if config.resolution is not None and not 1 <= config.resolution <= MAX_RESOLUTION:
+        raise InvalidInput(
+            f"resolution must be between 1 and {MAX_RESOLUTION} px, or empty for automatic"
+        )
 
     if config.transparent_background and (
         config.frame_color is not None or config.title or config.subtitle
@@ -809,6 +825,11 @@ def _build_matrix(config: QRConfig, error_correction: int) -> QRCode:
         raise InvalidInput(
             "the data is too large for a QR code; shorten it or reduce error correction"
         ) from exc
+    if config.resolution is not None:
+        # Explicit resolution: pick the box size that lands closest to the
+        # requested side without exceeding it (final = modules * box_size).
+        modules = qr.modules_count + config.border * 2
+        qr.box_size = max(1, config.resolution // modules)
     return qr
 
 
@@ -865,6 +886,7 @@ def _render_svg(
         back_color=None if config.transparent_background else _hex(bg),
         gradient_kind=config.gradient,
         gradient_to_hex=_hex(gt),
+        pixel_size_px=config.resolution,
     )
     return img.to_string(encoding="unicode").encode("utf-8")
 

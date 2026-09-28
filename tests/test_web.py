@@ -32,3 +32,10 @@ def test_logo_editor_fields_sent_only_when_set() -> None:
     branch = form_js.split('if (state.format === "svg")', 1)[1].split("return form;", 1)[0]
     assert "logo_crop" not in branch
     assert "logo_rotate" not in branch
+
+
+def test_resolution_travels_in_both_formats() -> None:
+    """The optional resolution field rides along for PNG and SVG alike."""
+    form_js = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    before_svg, _, _after = form_js.partition('if (state.format === "svg")')
+    assert 'form.append("resolution", state.resolution || "")' in before_svg

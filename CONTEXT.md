@@ -61,6 +61,11 @@ actualízalo aquí (ver skill domain-modeling).
 - **single-worker invariant**: un worker Uvicorn por contenedor; escalar
   con réplicas, nunca `--workers > 1` (el presupuesto en vuelo es por
   proceso y el tmpfs es por contenedor).
+- **resolution**: lado final del QR en píxeles (1-4096), opcional. En
+  PNG el servidor elige el `box_size` más grande que no supere el
+  objetivo; en SVG fija el tamaño intrínseco (`width`/`height` en px)
+  sin tocar el `viewBox`, que sigue escalando libremente. Vacío =
+  automática (por `box_size`).
 - **trusted proxy**: proxy de `FORWARDED_ALLOW_IPS` cuyo
   `X-Forwarded-For` se respeta; lectura derecha→izquierda saltando hops
   confiables; nunca rangos abiertos (`0.0.0.0/0` rechazado).

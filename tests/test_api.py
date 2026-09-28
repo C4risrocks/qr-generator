@@ -488,6 +488,26 @@ def test_generate_with_gradient_and_transparency() -> None:
     assert res.content[:8] == b"\x89PNG\r\n\x1a\n"
 
 
+def test_generate_resolution_controls_size() -> None:
+    res = client.post(
+        "/api/generate",
+        data={"data": "https://example.com", "resolution": "512"},
+    )
+    assert res.status_code == 200
+    img = Image.open(io.BytesIO(res.content))
+    assert img.size[0] <= 512
+    assert img.size[0] > 512 - img.size[0] // 10  # within a few boxes of the target
+
+
+def test_generate_resolution_out_of_range_rejected() -> None:
+    res = client.post(
+        "/api/generate",
+        data={"data": "https://example.com", "resolution": "5000"},
+    )
+    assert res.status_code == 400
+    assert "resolution must be between" in res.json()["detail"]
+
+
 def test_generate_rejects_bad_style() -> None:
     res = client.post(
         "/api/generate", data={"data": "https://example.com", "style": "nope"}

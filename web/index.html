@@ -445,6 +445,8 @@
         </div>
         <label for="border">Margen (módulos)</label>
         <input type="number" id="border" value="4" min="0" max="20">
+        <label for="resolution">Resolución (px, opcional)</label>
+        <input type="number" id="resolution" value="" min="16" max="4096" placeholder="automática" title="Lado final en píxeles; en SVG fija el tamaño intrínseco (el vector sigue escalando libremente)">
       </section>
 
       <section class="panel">
@@ -520,6 +522,7 @@
       ec: "M",
       box: 10,
       border: 4,
+      resolution: null,
       format: "png",
       logoFile: null,
       logoRatio: 0.2,
@@ -616,6 +619,10 @@
     $("ec").addEventListener("change", (e) => { state.ec = e.target.value; schedulePreview(); });
     $("box").addEventListener("input", (e) => { state.box = Math.max(1, Math.min(60, parseInt(e.target.value || "1", 10))); schedulePreview(); });
     $("border").addEventListener("input", (e) => { state.border = Math.max(0, Math.min(20, parseInt(e.target.value || "0", 10))); schedulePreview(); });
+    $("resolution").addEventListener("input", (e) => {
+      const value = parseInt(e.target.value, 10);
+      state.resolution = Number.isFinite(value) && value > 0 ? Math.min(value, 4096) : null;
+    });
     $("format").addEventListener("change", (e) => {
       state.format = e.target.value;
       updateCompat();
@@ -851,6 +858,7 @@
       form.append("error_correction", state.ec);
       form.append("box_size", state.box);
       form.append("border", state.border);
+      form.append("resolution", state.resolution || "");
       form.append("image_format", state.format);
       if (state.format === "svg") {
         // SVG cannot raster-composite the logo, frame or text: omit them.

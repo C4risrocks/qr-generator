@@ -132,5 +132,27 @@ def test_svg_omits_only_raster_only_options() -> None:
     assert path.get("fill") == "#000000"  # solid fg: gradient was none
 
 
+def test_resolution_sets_png_side_length() -> None:
+    """PNG export honours the requested pixel side length (floor, never over)."""
+    import io as _io
+
+    from PIL import Image as PILImage
+
+    result = generate_qr(make_config(image_format=PNG, box_size=10, resolution=1024))
+    img = PILImage.open(_io := _io.BytesIO(result.content))
+    modules = img.size[0]  # final = modules * box_size
+    assert img.size[0] <= 1024
+    assert img.size[0] > 1024 - modules  # within one module of the target
+
+
+def test_resolution_sets_svg_intrinsic_size() -> None:
+    result = generate_qr(make_config(image_format=SVG, resolution=512))
+    root = parse_svg(result.content)
+    assert root.get("width") == "512"
+    assert root.get("height") == "512"
+    # the viewBox stays module-based: the SVG keeps scaling freely
+    assert root.get("viewBox", "").startswith("0 0 ")
+
+
 def test_catalog_reports_all_styles_svg_capable() -> None:
     assert all(info.svg for info in STYLE_INFO), "SVG must support every style now"

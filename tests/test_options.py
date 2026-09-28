@@ -81,6 +81,24 @@ def test_unknown_override_rejected() -> None:
         parse_options({}, data="h", not_a_field=1)
 
 
+def test_resolution_coercion() -> None:
+    config = parse_options({"resolution": "1024"}, data="h")
+    assert config.resolution == 1024
+    config = parse_options({"resolution": ""}, data="h")
+    assert config.resolution is None
+    config = parse_options({}, data="h")
+    assert config.resolution is None
+
+
+def test_resolution_rejected_out_of_range() -> None:
+    from qrgen.core import generate_qr
+
+    with pytest.raises(InvalidInput, match="resolution must be between 1 and"):
+        generate_qr(parse_options({"resolution": "5000"}, data="h"))
+    with pytest.raises(InvalidInput, match="resolution must be between 1 and"):
+        generate_qr(parse_options({"resolution": "0"}, data="h"))
+
+
 def test_cli_mapping_with_none_frame() -> None:
     """CLI: --frame omitted passes None straight through (no 'None' string)."""
     config = parse_options(
