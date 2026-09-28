@@ -135,7 +135,10 @@ Abre http://127.0.0.1:8000 (solo local). La web incluye:
 
 - Galería visual de todos los estilos con miniaturas en vivo y selección.
 - Colores, paletas rápidas, gradientes y fondo transparente.
-- Logo central con control de tamaño.
+- Logo central con control de tamaño y **editor integrado**: recorte
+  libre o 1:1, rotación en 90° y aviso de ajuste. Si la imagen es mayor
+  de 1024 px el servidor la redimensiona con Lanczos (preservando alpha
+  y modo) y avisa; nunca rechaza.
 - Marco y título/subtítulo.
 - Entrada por texto/enlace o por archivo de texto `.txt` (UTF-8, máx. 2048).
 - Combinaciones predefinidas que aplican configuración completa.
@@ -216,7 +219,9 @@ automáticas, `read_only`, `tmpfs` para `/tmp` (64 MB), `cap_drop: [ALL]` y
   urlencoded individuales mayores a 1 MB que rechaza el parser de
   formularios responden `400` aunque el cuerpo quepa en el límite global.
 - Texto/archivo limitado a 2048 caracteres; archivos binarios o no UTF-8
-  rechazados; logo máx. 5 MB y 1024 × 1024 px.
+  rechazados; logo máx. 5 MB de subida. Los logos mayores de 1024 px se
+  ajustan con aviso (nunca 400); `logo_crop`/`logo_rotate` inválidos
+  responden 400.
 
 ## Despliegue con Dokploy
 

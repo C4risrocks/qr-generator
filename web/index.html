@@ -275,6 +275,31 @@
     .preset-card strong { display: block; font-size: 13px; }
     .preset-card small { color: var(--faint); font-size: 11px; }
 
+    #logo-editor {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      color: var(--text);
+      padding: 14px;
+      max-width: min(94vw, 500px);
+    }
+    #logo-editor::backdrop { background: rgba(0, 0, 0, 0.55); }
+    .editor-head { display: flex; align-items: center; justify-content: space-between; }
+    .editor-canvas-wrap {
+      display: flex; justify-content: center; margin: 10px 0;
+      background:
+        repeating-conic-gradient(rgba(127,127,127,0.18) 0% 25%, transparent 0% 50%) 0 0 / 16px 16px;
+    }
+    #editor-canvas {
+      cursor: crosshair; touch-action: none;
+      max-width: 100%; max-height: 62vh;
+      border: 1px dashed var(--border);
+    }
+    .editor-tools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+    .editor-tools output { margin-left: auto; font-size: 12px; color: var(--faint); }
+    .editor-tools .mini.on { border-color: var(--accent); color: var(--accent); }
+    .editor-foot { display: flex; justify-content: flex-end; gap: 8px; }
+
     footer { text-align: center; color: var(--faint); font-size: 11px; padding: 20px; }
   </style>
 </head>
@@ -372,10 +397,34 @@
             <input type="range" id="logo-ratio" min="0.05" max="0.25" step="0.01" value="0.2">
             <output id="logo-ratio-out">20%</output>
           </div>
-          <div style="margin-top: 8px;"><button class="mini" id="logo-remove" type="button">Quitar logo</button></div>
+          <div style="margin-top: 8px; display: flex; gap: 8px;">
+            <button class="mini" id="logo-edit" type="button">Editar logo</button>
+            <button class="mini" id="logo-remove" type="button">Quitar logo</button>
+          </div>
         </div>
-        <p class="hint">Con logo se fuerza corrección H para mantener la lectura.</p>
+        <p class="hint">Con logo se fuerza corrección H para mantener la lectura. Puedes recortar, fijar 1:1 y rotar la imagen.</p>
       </section>
+
+      <dialog id="logo-editor">
+        <div class="editor-head">
+          <strong>Editar logo</strong>
+          <button class="mini" id="editor-close" type="button" aria-label="Cerrar editor">&#10005;</button>
+        </div>
+        <div class="editor-canvas-wrap">
+          <canvas id="editor-canvas"></canvas>
+        </div>
+        <div class="editor-tools">
+          <button class="mini" id="editor-rotate-ccw" type="button" title="Rotar 90&deg; a la izquierda" aria-label="Rotar 90 grados a la izquierda">&#8634;</button>
+          <button class="mini" id="editor-rotate-cw" type="button" title="Rotar 90&deg; a la derecha" aria-label="Rotar 90 grados a la derecha">&#8635;</button>
+          <button class="mini" id="editor-square" type="button" aria-pressed="false" title="Proporci&oacute;n 1:1">1:1</button>
+          <button class="mini" id="editor-all" type="button">Toda la imagen</button>
+          <output id="editor-size">&mdash;</output>
+        </div>
+        <div class="editor-foot">
+          <button class="mini" id="editor-cancel" type="button">Cancelar</button>
+          <button class="primary" id="editor-apply" type="button">Aplicar</button>
+        </div>
+      </dialog>
 
       <section class="panel">
         <h2>Calidad</h2>
@@ -474,6 +523,8 @@
       format: "png",
       logoFile: null,
       logoRatio: 0.2,
+      logoRotate: 0,
+      logoCrop: null,
       frame: false,
       frameColor: "#18181b",
       title: "",
@@ -580,12 +631,16 @@
         return;
       }
       state.logoFile = file;
-      $("logo-name").textContent = file.name;
+      state.logoRotate = 0;
+      state.logoCrop = null;
       $("logo-controls").hidden = false;
       schedulePreview();
+      openLogoEditor();
     });
     $("logo-remove").addEventListener("click", () => {
       state.logoFile = null;
+      state.logoRotate = 0;
+      state.logoCrop = null;
       $("logo").value = "";
       $("logo-name").textContent = "Subir imagen (máx. 1024 px)";
       $("logo-controls").hidden = true;
@@ -596,6 +651,190 @@
       $("logo-ratio-out").textContent = Math.round(state.logoRatio * 100) + "%";
       schedulePreview();
     });
+
+    // --- Logo editor: crop, 1:1 toggle and quarter-turn rotation -------
+    const editor = { img: null, rotate: 0, crop: null, dragging: false, dragStart: null, square: false };
+
+    function loadImage(file) {
+      return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+        img.onerror = (err) => { URL.revokeObjectURL(url); reject(err); };
+        img.src = url;
+      });
+    }
+
+    async function openLogoEditor() {
+      if (!state.logoFile) return;
+      try {
+        editor.img = await loadImage(state.logoFile);
+      } catch {
+        // El navegador no puede decodificarla (p. ej. SVG): se sube tal cual.
+        return;
+      }
+      editor.rotate = state.logoRotate;
+      editor.crop = state.logoCrop ? { ...state.logoCrop } : null;
+      $("logo-editor").showModal();
+      drawEditorCanvas();
+    }
+
+    function editorRotatedSize() {
+      const img = editor.img;
+      return (editor.rotate === 90 || editor.rotate === 270)
+        ? { w: img.naturalHeight, h: img.naturalWidth }
+        : { w: img.naturalWidth, h: img.naturalHeight };
+    }
+
+    function drawEditorCanvas() {
+      const canvas = $("editor-canvas");
+      const rot = editorRotatedSize();
+      const scale = Math.min(380 / rot.w, 300 / rot.h, 1);
+      canvas.width = Math.max(1, Math.round(rot.w * scale));
+      canvas.height = Math.max(1, Math.round(rot.h * scale));
+      canvas._scale = scale;
+      canvas._rot = rot;
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.save();
+      if (editor.rotate === 90) {
+        ctx.translate(canvas.width, 0); ctx.rotate(Math.PI / 2);
+      } else if (editor.rotate === 180) {
+        ctx.translate(canvas.width, canvas.height); ctx.rotate(Math.PI);
+      } else if (editor.rotate === 270) {
+        ctx.translate(0, canvas.height); ctx.rotate(-Math.PI / 2);
+      }
+      ctx.drawImage(editor.img, 0, 0);
+      ctx.restore();
+
+      const c = editor.crop || { x: 0, y: 0, w: rot.w, h: rot.h };
+      const r = { x: c.x * scale, y: c.y * scale, w: c.w * scale, h: c.h * scale };
+      ctx.save();
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.beginPath();
+      ctx.rect(0, 0, canvas.width, canvas.height);
+      ctx.rect(r.x, r.y, r.w, r.h);
+      ctx.fill("evenodd");
+      ctx.strokeStyle = "#3b82f6";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(r.x, r.y, r.w, r.h);
+      ctx.restore();
+
+      $("editor-size").textContent = editor.crop
+        ? `Selección: ${c.w}\u00d7${c.h} px`
+        : `Toda la imagen: ${rot.w}\u00d7${rot.h} px`;
+    }
+
+    function toNatural(ev) {
+      const canvas = $("editor-canvas");
+      const rect = canvas.getBoundingClientRect();
+      // CSS may shrink the canvas below its intrinsic size
+      const cssScale = canvas.width / rect.width;
+      const clamp = (v, max) => Math.min(Math.max(v, 0), max);
+      return {
+        x: clamp(Math.round((ev.clientX - rect.left) * cssScale / canvas._scale), canvas._rot.w),
+        y: clamp(Math.round((ev.clientY - rect.top) * cssScale / canvas._scale), canvas._rot.h),
+      };
+    }
+
+    function updateDrag(cur) {
+      const rot = editorRotatedSize();
+      const s = editor.dragStart;
+      let x = Math.min(s.x, cur.x), y = Math.min(s.y, cur.y);
+      let w = Math.abs(cur.x - s.x), h = Math.abs(cur.y - s.y);
+      if (editor.square) {
+        const side = Math.max(w, h);
+        w = side; h = side;
+        if (cur.x < s.x) x = s.x - side; else x = Math.min(x, s.x);
+        if (cur.y < s.y) y = s.y - side; else y = Math.min(y, s.y);
+      }
+      x = clamp(x, rot.w - 1); y = clamp(y, rot.h - 1);
+      w = Math.min(w, rot.w - x); h = Math.min(h, rot.h - y);
+      editor.crop = { x, y, w: Math.max(1, w), h: Math.max(1, h) };
+    }
+
+    function rotateCrop(delta) {
+      const rot = editorRotatedSize();
+      const c = editor.crop;
+      editor.rotate = (editor.rotate + delta + 360) % 360;
+      if (c) {
+        // map the selection into the new rotated frame
+        const nx = delta > 0 ? rot.h - c.y - c.h : c.y;
+        const ny = delta > 0 ? c.x : rot.w - c.x - c.w;
+        editor.crop = {
+          x: Math.max(0, Math.min(nx, rot.h - c.h)),
+          y: Math.max(0, Math.min(ny, rot.w - c.w)),
+          w: c.h, h: c.w,
+        };
+      }
+      drawEditorCanvas();
+    }
+
+    function applyEditor() {
+      const rot = editorRotatedSize();
+      const c = editor.crop;
+      const full = !c || (c.x === 0 && c.y === 0 && c.w === rot.w && c.h === rot.h);
+      state.logoCrop = full ? null : { x: c.x, y: c.y, w: c.w, h: c.h };
+      state.logoRotate = editor.rotate;
+      refreshLogoLabel();
+      $("logo-editor").close();
+      schedulePreview();
+    }
+
+    function refreshLogoLabel() {
+      if (!state.logoFile) {
+        $("logo-name").textContent = "Subir imagen (máx. 1024 px)";
+        return;
+      }
+      const bits = [];
+      if (state.logoRotate) bits.push(`rot ${state.logoRotate}\u00b0`);
+      if (state.logoCrop) bits.push(`${state.logoCrop.w}\u00d7${state.logoCrop.h}`);
+      $("logo-name").textContent = bits.length
+        ? `${state.logoFile.name} (${bits.join(", ")})`
+        : state.logoFile.name;
+    }
+
+    const canvas = $("editor-canvas");
+    canvas.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      editor.dragging = true;
+      editor.dragStart = toNatural(ev);
+      canvas.setPointerCapture(ev.pointerId);
+    });
+    canvas.addEventListener("pointermove", (ev) => {
+      if (!editor.dragging) return;
+      updateDrag(toNatural(ev));
+      drawEditorCanvas();
+    });
+    canvas.addEventListener("pointerup", (ev) => {
+      if (!editor.dragging) return;
+      editor.dragging = false;
+      updateDrag(toNatural(ev));
+      const rot = editorRotatedSize();
+      if (editor.crop && (editor.crop.w < 4 || editor.crop.h < 4)) {
+        editor.crop = null; // click sin arrastre: selección completa
+      }
+      drawEditorCanvas();
+    });
+    canvas.addEventListener("pointercancel", () => {
+      editor.dragging = false;
+    });
+
+    $("logo-edit").addEventListener("click", openLogoEditor);
+    $("editor-close").addEventListener("click", () => $("logo-editor").close());
+    $("editor-cancel").addEventListener("click", () => $("logo-editor").close());
+    $("editor-rotate-cw").addEventListener("click", () => rotateCrop(90));
+    $("editor-rotate-ccw").addEventListener("click", () => rotateCrop(-90));
+    $("editor-all").addEventListener("click", () => {
+      editor.crop = null;
+      drawEditorCanvas();
+    });
+    $("editor-square").addEventListener("click", (e) => {
+      editor.square = !editor.square;
+      e.currentTarget.classList.toggle("on", editor.square);
+      e.currentTarget.setAttribute("aria-pressed", String(editor.square));
+    });
+    $("editor-apply").addEventListener("click", applyEditor);
 
     function buildFormData() {
       const form = new FormData();
@@ -623,7 +862,11 @@
         form.append("subtitle", "");
         return form;
       }
-      if (state.logoFile) form.append("logo", state.logoFile);
+      if (state.logoFile) {
+        form.append("logo", state.logoFile);
+        if (state.logoCrop) form.append("logo_crop", JSON.stringify(state.logoCrop));
+        if (state.logoRotate) form.append("logo_rotate", String(state.logoRotate));
+      }
       form.append("logo_ratio", state.logoRatio);
       form.append("transparent_background", state.transparent);
       form.append("frame_color", state.frame ? state.frameColor : "");

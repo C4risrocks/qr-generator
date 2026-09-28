@@ -495,15 +495,95 @@ def test_generate_rejects_bad_style() -> None:
     assert res.status_code == 400
 
 
-def test_generate_rejects_large_logo() -> None:
-    big = Image.new("RGB", (3000, 3000), (255, 0, 0))
+def test_generate_resizes_large_logo() -> None:
+    """Oversized logos are fitted with a warning, never rejected."""
+    big = Image.new("RGBA", (3000, 3000), (255, 0, 0, 128))
     res = client.post(
         "/api/generate",
         data={"data": "https://example.com"},
         files={"logo": ("logo.png", png_bytes(big), "image/png")},
     )
+    assert res.status_code == 200
+    assert res.content[:8] == b"\x89PNG\r\n\x1a\n"
+    warnings = res.headers.get("x-qr-warnings", "")
+    assert "resized to 1024x1024" in warnings
+    assert "raised to H" in warnings
+
+
+def test_generate_crops_logo() -> None:
+    """A crop box (rotated-image pixels) selects a region before embedding."""
+    logo = Image.new("RGB", (200, 200), (0, 0, 255))
+    logo.putpixel((0, 0), (255, 0, 0))  # top-left red marker
+    res = client.post(
+        "/api/generate",
+        data={
+            "data": "https://example.com",
+            "logo_crop": '{"x":0,"y":0,"w":100,"h":100}',
+        },
+        files={"logo": ("logo.png", png_bytes(logo), "image/png")},
+    )
+    assert res.status_code == 200
+    assert res.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_generate_rotates_logo() -> None:
+    logo = Image.new("RGB", (160, 80), (0, 255, 0))
+    res = client.post(
+        "/api/generate",
+        data={
+            "data": "https://example.com",
+            "logo_rotate": "90",
+        },
+        files={"logo": ("logo.png", png_bytes(logo), "image/png")},
+    )
+    assert res.status_code == 200
+
+
+def test_generate_rejects_bad_logo_rotate() -> None:
+    logo = Image.new("RGB", (64, 64))
+    for raw in ("45", "abc"):
+        res = client.post(
+            "/api/generate",
+            data={"data": "https://example.com", "logo_rotate": raw},
+            files={"logo": ("logo.png", png_bytes(logo), "image/png")},
+        )
+        assert res.status_code == 400
+
+
+def test_generate_rejects_crop_out_of_bounds() -> None:
+    logo = Image.new("RGB", (64, 64))
+    res = client.post(
+        "/api/generate",
+        data={
+            "data": "https://example.com",
+            "logo_crop": '{"x":0,"y":0,"w":128,"h":10}',
+        },
+        files={"logo": ("logo.png", png_bytes(logo), "image/png")},
+    )
     assert res.status_code == 400
-    assert "too large" in res.json()["detail"]
+    assert "exceeds the image bounds" in res.json()["detail"]
+
+
+def test_generate_rejects_malformed_crop() -> None:
+    logo = Image.new("RGB", (64, 64))
+    res = client.post(
+        "/api/generate",
+        data={"data": "https://example.com", "logo_crop": "not-json"},
+        files={"logo": ("logo.png", png_bytes(logo), "image/png")},
+    )
+    assert res.status_code == 400
+    assert "logo_crop" in res.json()["detail"]
+
+
+def test_previews_merge_logo_warnings() -> None:
+    big = Image.new("RGB", (3000, 3000))
+    res = client.post(
+        "/api/previews",
+        data={"data": "https://example.com"},
+        files={"logo": ("logo.png", png_bytes(big), "image/png")},
+    )
+    assert res.status_code == 200
+    assert any("resized" in w for w in res.json()["warnings"])
 
 
 def test_generate_rejects_invalid_logo() -> None:

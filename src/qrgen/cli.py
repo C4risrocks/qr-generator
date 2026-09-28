@@ -21,7 +21,7 @@ from qrgen.core import (
     InvalidInput,
     generate_qr,
     parse_options,
-    validate_logo,
+    prepare_logo,
 )
 from qrgen.inputs import parse_file, parse_text
 from qrgen.passwords import hash_password
@@ -126,16 +126,23 @@ def run_generate(argv: list[str]) -> int:
         image_format = suffix if suffix in FORMATS else PNG
 
     logo = None
+    logo_warnings: tuple[str, ...] = ()
     if args.logo:
         from PIL import Image
 
         try:
             logo = Image.open(args.logo)
-            validate_logo(logo)
             logo.load()
         except (OSError, ValueError) as exc:
             print(f"error: cannot read logo image {args.logo!r}: {exc}", file=sys.stderr)
             return 2
+        try:
+            logo, logo_warnings = prepare_logo(logo)
+        except InvalidInput as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        for warning in logo_warnings:
+            print(f"warning: {warning}", file=sys.stderr)
 
     # The CLI adapter: argparse dests mapped to the canonical QRConfig
     # field names so both adapters share one option contract.

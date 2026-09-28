@@ -22,8 +22,13 @@ actualízalo aquí (ver skill domain-modeling).
   catálogo (`/api/catalog`) y la web.
 - **gradient**: relleno de módulos (`none`, `linear-h`, `linear-v`,
   `radial`); no disponible en SVG (cae a color sólido con aviso).
-- **logo**: imagen incrustada al centro (≤ 5 MB, ≤ 1024 px, ratio ≤ 0.3).
-  Fuerza corrección de error `H`. PNG-only.
+- **logo**: imagen incrustada al centro (≤ 5 MB de subida, ratio ≤ 0.3).
+  Fuerza corrección de error `H`. PNG-only en la salida. El editor web
+  puede **rotar** (90° por transposición, sin pérdida) y **recortar**
+  (`logo_crop`, coordenadas en la imagen ya rotada); si el resultado
+  excede 1024 px el servidor lo ajusta con Lanczos + premultiplicación
+  de alpha y avisa (nunca rechaza). El modo se conserva (RGB→RGB,
+  RGBA→RGBA). Ver ADR-0003.
 - **frame / title / subtitle**: marco con color, título y subtítulo
   alrededor del QR. Trio PNG-only.
 - **preview**: miniatura PNG por estilo (galería) o vista fiel de la

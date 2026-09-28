@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import io
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from dataclasses import fields as dataclass_fields
 from decimal import Decimal
 from typing import Any, get_args, get_type_hints
 
-from PIL import Image, ImageColor, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFont, ImageOps
 from qrcode import QRCode, constants
 from qrcode.exceptions import DataOverflowError
 from qrcode.image.styledpil import StyledPilImage
@@ -351,12 +352,152 @@ def parse_color(value: str) -> tuple[int, int, int]:
     return tuple(color)  # type: ignore[return-value]
 
 
-def validate_logo(image: Image.Image) -> None:
-    """Reject logos whose pixel dimensions exceed the documented limit."""
-    if image.width > MAX_LOGO_DIMENSIONS or image.height > MAX_LOGO_DIMENSIONS:
-        raise InvalidInput(
-            f"logo image too large ({image.width}x{image.height}); maximum is {MAX_LOGO_DIMENSIONS}x{MAX_LOGO_DIMENSIONS} px"
+LOGO_ROTATIONS = (0, 90, 180, 270)
+
+
+def parse_logo_crop(raw: str | None) -> tuple[int, int, int, int] | None:
+    """Parse the optional logo crop box (coordinates in the rotated image).
+
+    Accepts a JSON object with exactly ``x``, ``y``, ``w``, ``h`` integer
+    keys, or ``None``/empty for no crop. Raises InvalidInput with
+    user-visible messages otherwise.
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise InvalidInput("logo_crop must be a JSON object with x, y, w, h") from exc
+    if not isinstance(data, dict) or set(data) != {"x", "y", "w", "h"}:
+        raise InvalidInput("logo_crop must be a JSON object with x, y, w, h")
+    for key in ("x", "y", "w", "h"):
+        value = data[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise InvalidInput(f"logo_crop {key} must be an integer")
+    x, y, w, h = data["x"], data["y"], data["w"], data["h"]
+    if w < 1 or h < 1:
+        raise InvalidInput("logo_crop box must have positive width and height")
+    if x < 0 or y < 0:
+        raise InvalidInput("logo_crop coordinates must be non-negative")
+    return (x, y, w, h)
+
+
+def _premultiply(image: Image.Image) -> Image.Image:
+    """Straight-alpha premultiplication, so Lanczos resampling of the color
+    channels cannot bleed colour into fully transparent regions."""
+    if image.mode == "RGBA":
+        r, g, b, a = image.split()
+        return Image.merge(
+            "RGBA",
+            (
+                ImageChops.multiply(r, a),
+                ImageChops.multiply(g, a),
+                ImageChops.multiply(b, a),
+                a,
+            ),
         )
+    if image.mode == "LA":
+        l_channel, a_channel = image.split()
+        return Image.merge("LA", (ImageChops.multiply(l_channel, a_channel), a_channel))
+    return image
+
+
+def _unpremultiply_semi_alpha(image: Image.Image) -> Image.Image:
+    """Undo the premultiplication only where the resized alpha is partial.
+
+    Fully opaque or fully transparent pixels need no correction, so hard
+    edged logos (the common case) skip the Python loop entirely.
+    """
+    if image.mode not in ("RGBA", "LA"):
+        return image
+    low, high = image.getchannel("A").getextrema()
+    if high == 0 or low == 255:
+        return image
+    pixels = image.load()
+    width, height = image.size
+    for y in range(height):
+        for x in range(width):
+            values = pixels[x, y]
+            a = values[-1]
+            if 0 < a < 255:
+                pixels[x, y] = tuple(
+                    min(255, (c * 255 + a // 2) // a) for c in values[:-1]
+                ) + (a,)
+    return image
+
+
+def _resize_lanczos(image: Image.Image, width: int, height: int) -> Image.Image:
+    """High-quality resampling that preserves the image mode.
+
+    RGBA/LA are resampled with alpha premultiplication; indexed palettes
+    cannot be resized as indexes (colours would corrupt) so they convert
+    once to RGBA (with transparency) or RGB.
+    """
+    if image.mode in ("RGB", "L"):
+        return image.resize((width, height), Image.Resampling.LANCZOS)
+    if image.mode == "P":
+        target = "RGBA" if "transparency" in image.info else "RGB"
+        return _resize_lanczos(image.convert(target), width, height)
+    if image.mode in ("RGBA", "LA"):
+        resized = _premultiply(image).resize(
+            (width, height), Image.Resampling.LANCZOS
+        )
+        return _unpremultiply_semi_alpha(resized)
+    target = "RGBA" if "transparency" in image.info else "RGB"
+    return _resize_lanczos(image.convert(target), width, height)
+
+
+def prepare_logo(
+    image: Image.Image,
+    *,
+    rotate: int = 0,
+    crop: tuple[int, int, int, int] | None = None,
+) -> tuple[Image.Image, tuple[str, ...]]:
+    """Apply the editor transforms (rotate in quarter turns, crop) and fit
+    the logo to the embedding limit with the least quality loss.
+
+    EXIF orientation is applied first (browsers already render the image
+    upright). Rotation is a lossless transpose and cropping is lossless;
+    only when the result exceeds MAX_LOGO_DIMENSIONS in either side is it
+    downscaled, with Lanczos and alpha premultiplication, preserving the
+    aspect ratio. Colour characteristics survive: RGBA keeps its alpha
+    channel intact, RGB/L keep their mode; oversized logos answer with a
+    warning instead of a rejection, mirroring the SVG-omission policy.
+    """
+    if rotate not in LOGO_ROTATIONS:
+        raise InvalidInput("logo_rotate must be 0, 90, 180 or 270")
+    warnings: list[str] = []
+
+    upright = ImageOps.exif_transpose(image)
+    if rotate == 90:
+        upright = upright.transpose(Image.Transpose.ROTATE_270)  # clockwise
+    elif rotate == 180:
+        upright = upright.transpose(Image.Transpose.ROTATE_180)
+    elif rotate == 270:
+        upright = upright.transpose(Image.Transpose.ROTATE_90)  # counter-clockwise
+
+    if crop is not None:
+        x, y, w, h = crop
+        if x + w > upright.width or y + h > upright.height:
+            raise InvalidInput(
+                f"logo_crop exceeds the image bounds ({upright.width}x{upright.height})"
+            )
+        upright = upright.crop((x, y, x + w, y + h))
+
+    if upright.width <= MAX_LOGO_DIMENSIONS and upright.height <= MAX_LOGO_DIMENSIONS:
+        return upright, tuple(warnings)
+
+    scale = min(
+        MAX_LOGO_DIMENSIONS / upright.width,
+        MAX_LOGO_DIMENSIONS / upright.height,
+    )
+    new_width = max(1, min(MAX_LOGO_DIMENSIONS, round(upright.width * scale)))
+    new_height = max(1, min(MAX_LOGO_DIMENSIONS, round(upright.height * scale)))
+    fitted = _resize_lanczos(upright, new_width, new_height)
+    warnings.append(
+        f"logo was {upright.width}x{upright.height} px; resized to {new_width}x{new_height}"
+    )
+    return fitted, tuple(warnings)
 
 
 def _relative_luminance(rgb: tuple[int, int, int]) -> float:

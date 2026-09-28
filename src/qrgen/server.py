@@ -41,8 +41,9 @@ from qrgen.core import (
     QRConfig,
     generate_previews,
     generate_qr,
+    parse_logo_crop,
     parse_options,
-    validate_logo,
+    prepare_logo,
 )
 from qrgen.inputs import InputPayload
 from qrgen.proxy import client_ip
@@ -140,31 +141,39 @@ class FormRequest:
     config: QRConfig
     payload: InputPayload
     client_id: int | None
+    warnings: tuple[str, ...] = ()
 
 
 # Module level on purpose: FastAPI evaluates annotations against module
 # globals, so the dependency and its result type cannot live inside
 # build_app's closure when __future__ annotations are on.
-async def _read_logo(logo: UploadFile | None) -> Image.Image | None:
+async def _read_logo(
+    logo: UploadFile | None,
+    *,
+    rotate: int = 0,
+    crop: tuple[int, int, int, int] | None = None,
+) -> tuple[Image.Image | None, tuple[str, ...]]:
+    """Decode, apply the editor transforms and fit the logo.
+
+    Returns the processed image plus warnings; oversized logos are
+    resized (never rejected) so the result is always embeddable.
+    """
     if logo is None:
-        return None
+        return None, ()
     raw = await logo.read(MAX_LOGO_BYTES + 1)
     if not raw:
-        return None
+        return None, ()
     if len(raw) > MAX_LOGO_BYTES:
         raise HTTPException(status_code=400, detail="logo image exceeds the 5 MB limit")
     try:
         image = Image.open(io.BytesIO(raw))
-        try:
-            validate_logo(image)
-        except InvalidInput as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
         image.load()
-    except HTTPException:
-        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail="invalid logo image") from exc
-    return image
+    try:
+        return prepare_logo(image, rotate=rotate, crop=crop)
+    except InvalidInput as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 async def _resolve_input(data: str, file: UploadFile | None) -> InputPayload:
@@ -194,11 +203,28 @@ async def form_request(request: Request) -> FormRequest:
     form = await request.form()
     file = form.get("file")
     logo = form.get("logo")
+    rotate_raw = str(form.get("logo_rotate", "0") or "0")
+    try:
+        rotate = int(rotate_raw.strip())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail="logo_rotate must be an integer (0, 90, 180 or 270)"
+        ) from exc
+    try:
+        crop = parse_logo_crop(
+            str(form.get("logo_crop")) if form.get("logo_crop") is not None else None
+        )
+    except InvalidInput as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     payload = await _resolve_input(
         str(form.get("data", "")),
         file if isinstance(file, StarletteUploadFile) else None,
     )
-    logo_image = await _read_logo(logo if isinstance(logo, StarletteUploadFile) else None)
+    logo_image, logo_warnings = await _read_logo(
+        logo if isinstance(logo, StarletteUploadFile) else None,
+        rotate=rotate,
+        crop=crop,
+    )
     try:
         config = parse_options(form, data=payload.content, logo=logo_image)
     except InvalidInput as exc:
@@ -207,6 +233,7 @@ async def form_request(request: Request) -> FormRequest:
         config=config,
         payload=payload,
         client_id=getattr(request.state, "client_id", None),
+        warnings=logo_warnings,
     )
 
 
@@ -333,7 +360,7 @@ def build_app(
                     "image": "data:image/png;base64,"
                     + base64.b64encode(selected.content).decode("ascii"),
                 },
-                "warnings": list(warnings),
+                "warnings": list(qr.warnings) + list(warnings),
             }
         )
 
@@ -349,7 +376,7 @@ def build_app(
 
         background_tasks.add_task(inputs.persist_input, qr.client_id, qr.payload)
 
-        headers = {"X-QR-Warnings": "; ".join(result.warnings)}
+        headers = {"X-QR-Warnings": "; ".join(qr.warnings + result.warnings)}
         return Response(
             content=result.content,
             media_type=MEDIA_TYPES[result.image_format],
